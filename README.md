@@ -33,8 +33,12 @@ context, so F16 KV remains the production default. Raw summary data lives in
 
 The Qwen3.8-27B `Q4_K_M` single-GPU profile keeps the full 262K context and
 multimodal projector while leaving GPU1 idle. With Q4_0 KV, MTP draft length 1,
-and V100 application clocks fixed at 1380 MHz, it reaches **43.420 tok/s** on
-the 512-token short test and **21.847 tok/s** after a 64,810-token prompt.
+a 131,072-token MTP proposal vocabulary, and V100 application clocks fixed at
+1380 MHz, it reaches **44.201 tok/s** on the 512-token short test. The proposal
+head optimization improved an isolated 64,810-token A/B from `27.530` to
+`27.802 tok/s`; target verification still uses the complete vocabulary. An
+actual 255,000-token capacity run completed at `12.617 tok/s` decode with
+`25,145 MiB` peak VRAM.
 Use [`config/qwen3.8-27b-single-v100.env.example`](config/qwen3.8-27b-single-v100.env.example)
 and see the linked report for the quality/performance trade-offs.
 
@@ -53,6 +57,12 @@ On the validated server, reproduce the deployed Docker profile with:
   - everything in `safe`;
   - row-per-warp CUDA `GATED_DELTA_NET`, forward-ported to the current
     recurrent rollback and fused-cache interface.
+- [`patches/mtp-subvocab.patch`](patches/mtp-subvocab.patch)
+  - optional Qwen3.5/3.8 MTP-only proposal-head slicing;
+  - keeps full-vocabulary target verification and requires backend draft
+    sampling;
+  - enabled with `LLAMA_MTP_SUBVOCAB=131072` in the deployed single-V100
+    profile.
 
 The safe variant produced byte-identical 512-token output versus the pinned
 baseline. The operator variant changes floating-point reduction order, so its
@@ -61,23 +71,23 @@ text can differ while still passing CUDA-versus-CPU operator reference tests.
 ## Quick start
 
 ```bash
-# Creates an isolated source checkout under .work/ and applies one patch.
-./scripts/prepare-source.sh operator
+# Creates an isolated source checkout under .work/ and applies the patch stack.
+./scripts/prepare-source.sh operator-subvocab
 
 # Run this on a CUDA build host with V100-class SM70 support.
-./scripts/build-sm70.sh .work/llama.cpp-operator .work/build-operator
+./scripts/build-sm70.sh .work/llama.cpp-operator-subvocab .work/build-operator-subvocab
 
 # Configure model paths without committing them.
 cp config/qwen3.8-27b.env.example .env
 $EDITOR .env
 
-CONFIG=.env BUILD_DIR=.work/build-operator ./scripts/run-server.sh
+CONFIG=.env BUILD_DIR=.work/build-operator-subvocab ./scripts/run-server.sh
 ```
 
 Remote build from a workstation:
 
 ```bash
-REMOTE=WZU_Server ./scripts/remote-build.sh operator
+REMOTE=WZU_Server ./scripts/remote-build.sh operator-subvocab
 ```
 
 Benchmark the native llama.cpp endpoint:
@@ -88,6 +98,17 @@ python3 benchmarks/llama_native_bench.py \
   --prompt-file benchmarks/prompts/short.txt \
   --n-predict 512 --runs 3 \
   --output results/raw/operator-short.jsonl
+```
+
+Add `--chat` to benchmark the OpenAI-compatible chat endpoint, including
+`reasoning_content` emitted by thinking models.
+
+Generate the deterministic near-full-context capacity fixture locally (for
+this Qwen tokenizer, `" test"` is one token):
+
+```bash
+python3 benchmarks/generate_repeated_prompt.py \
+  --output /tmp/context-255k.txt --repeats 255000
 ```
 
 ## Optimization contract

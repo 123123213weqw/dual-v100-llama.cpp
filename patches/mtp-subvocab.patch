@@ -1,0 +1,30 @@
+diff --git a/src/models/qwen35.cpp b/src/models/qwen35.cpp
+index 309dd4324..6f9ab164f 100644
+--- a/src/models/qwen35.cpp
++++ b/src/models/qwen35.cpp
+@@ -639,3 +639,24 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
+     GGML_ASSERT(head_w && "QWEN35 MTP: missing LM head (nextn.shared_head_head or model.output)");
+-    cur = build_lora_mm(head_w, cur, head_s);
++
++    // MTP predictions are proposals only: the target model still verifies every
++    // drafted token against the full vocabulary before committing it. Restricting
++    // the draft LM head therefore trades acceptance rate for much less memory
++    // traffic without changing the target model's token distribution. Keep this
++    // opt-in and require backend sampling, because the raw-logits host path expects
++    // exactly n_vocab floats per row.
++    static const int64_t mtp_sub_vocab = [] {
++        const char * env = getenv("LLAMA_MTP_SUBVOCAB");
++        return env != nullptr ? atoll(env) : 0;
++    }();
++
++    if (!samplers.empty() && mtp_sub_vocab > 0 && mtp_sub_vocab < head_w->ne[1]) {
++        ggml_tensor * head_sub = ggml_view_2d(ctx0, head_w,
++                head_w->ne[0], mtp_sub_vocab, head_w->nb[1], 0);
++        cur = ggml_mul_mat(ctx0, head_sub, cur);
++        if (head_s != nullptr) {
++            cur = ggml_mul(ctx0, cur, head_s);
++        }
++    } else {
++        cur = build_lora_mm(head_w, cur, head_s);
++    }
+     cb(cur, "result_output", -1);

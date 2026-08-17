@@ -11,8 +11,12 @@ case "$VARIANT" in
     safe|operator)
         PATCH_SHA=$(shasum -a 256 "$ROOT/patches/$VARIANT.patch" | awk '{print substr($1,1,12)}')
         ;;
+    operator-subvocab)
+        PATCH_SHA=$(cat "$ROOT/patches/operator.patch" "$ROOT/patches/mtp-subvocab.patch" | \
+            shasum -a 256 | awk '{print substr($1,1,12)}')
+        ;;
     *)
-        echo "usage: $0 {baseline|safe|operator}" >&2
+        echo "usage: $0 {baseline|safe|operator|operator-subvocab}" >&2
         exit 2
         ;;
 esac

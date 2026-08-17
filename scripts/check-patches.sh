@@ -18,3 +18,9 @@ for patch in "$ROOT/patches/safe.patch" "$ROOT/patches/operator.patch"; do
     git -C "$TMP/llama.cpp" apply --check "$patch"
     echo "OK: $(basename "$patch")"
 done
+
+# The MTP sub-vocabulary patch is a composition layer on top of operator.
+git -C "$TMP/llama.cpp" reset -q --hard FETCH_HEAD
+git -C "$TMP/llama.cpp" apply "$ROOT/patches/operator.patch"
+git -C "$TMP/llama.cpp" apply --check "$ROOT/patches/mtp-subvocab.patch"
+echo "OK: operator.patch + mtp-subvocab.patch"

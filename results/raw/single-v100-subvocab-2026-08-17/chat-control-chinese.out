@@ -1,0 +1,2 @@
+{"timestamp": "2026-08-17T20:53:53+0800", "wall_seconds": 6.961475586984307, "prompt_n": 152, "prompt_ms": 917.592, "prompt_per_second": 165.65096469890756, "predicted_n": 256, "predicted_ms": 5681.521, "predicted_per_second": 44.88234752630502, "content_sha256": "b745d614e1fb2364ccbf760b5bf7020e857bc799db18fd82e70219f898677c55", "stop": "length", "stopped_eos": null, "stopped_limit": null, "run": 1}
+summary={"runs": 1, "decode_tps_mean": 44.88234752630502, "decode_tps_min": 44.88234752630502, "decode_tps_max": 44.88234752630502, "decode_tps_stdev": 0.0}

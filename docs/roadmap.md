@@ -18,6 +18,7 @@
 
 ## P2: single-user decode
 
+- [x] Add and A/B an MTP-only proposal sub-vocabulary with full target verification.
 - [ ] Profile kernel time by context length: 4K, 32K, 64K, 128K, 256K.
 - [ ] Tune GDN launch geometry for V100 SM occupancy and register pressure.
 - [ ] Measure multi-block ARGMAX break-even points by vocab and row count.
@@ -35,5 +36,6 @@
 
 - [ ] Evaluate mixed KV types rather than all-F16 or all-Q8_0.
 - [ ] Characterize KV bandwidth versus compute by context length.
-- [ ] Add deterministic 128K and 256K prompt fixtures generated locally.
+- [x] Add a deterministic near-256K capacity prompt generator.
+- [x] Execute a 255K-token single-V100 capacity/decode test with the production profile.
 - [ ] Measure MTP acceptance rate as context grows.

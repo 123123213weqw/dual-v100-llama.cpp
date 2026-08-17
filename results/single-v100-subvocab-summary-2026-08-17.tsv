@@ -1,0 +1,11 @@
+case	workload	mtp_subvocab	prompt_tokens	generation_tokens	decode_tok_s	acceptance	content_sha256
+control-short	completion-short	0	40	256	42.761761	0.75172	f2825630be28041ec681f6dd59ec50aa79ae8c5ac214fde1e2f6208e736632ae
+sub131k-short	completion-short	131072	40	256	43.492580	0.75172	f2825630be28041ec681f6dd59ec50aa79ae8c5ac214fde1e2f6208e736632ae
+control-chat-suite	chat-4-prompt-mean	0	-	256	44.977184	unchanged	all-match-candidate
+sub196k-chat-suite	chat-4-prompt-mean	196608	-	256	45.229475	unchanged	all-match-control
+sub131k-chat-suite	chat-4-prompt-mean	131072	-	256	45.575556	unchanged	all-match-control
+sub115k-chat-suite	chat-4-prompt-mean	114688	-	256	45.492841	chinese-0.79577-vs-0.84783	all-match-control
+control-64k	completion-long	0	64810	226	27.530095	0.92308	8760b9326c22e2ca7f2c370696401a19c7a0266b7833b593e98fa83867bd7880
+sub131k-64k	completion-long	131072	64810	226	27.802247	0.92308	8760b9326c22e2ca7f2c370696401a19c7a0266b7833b593e98fa83867bd7880
+sub131k-production	completion-short-final	131072	40	512	44.201247	0.78049	d95cfcf08627fbdaa0b820c824ebed025f6674b3c64624b63e941cf5556bbe4c
+sub131k-255k-capacity	completion-capacity	131072	255000	128	12.617260	1.00000	5726c1347b8a76cd4f4b84456c94247e9d0d17e369a084ca885b8391e084f55f

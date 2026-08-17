@@ -17,6 +17,19 @@
         "mtp-multi-ubatch-serialization",
         "gated-delta-net-row-per-warp"
       ]
+    },
+    "operator-subvocab": {
+      "files": ["operator.patch", "mtp-subvocab.patch"],
+      "sha256": [
+        "3303d9174a7699c5f08729c7edc5d6ba96e78cb71c18294cdc7f2ff723b691b9",
+        "29c0fcfe063a4255cd2ac03f22d6f41500b53a8bd70cc5088a85f1b9f1024c57"
+      ],
+      "components": [
+        "argmax-multiblock",
+        "mtp-multi-ubatch-serialization",
+        "gated-delta-net-row-per-warp",
+        "qwen35-mtp-subvocab"
+      ]
     }
   }
 }

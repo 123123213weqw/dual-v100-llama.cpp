@@ -5,9 +5,15 @@ root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 container=${CONTAINER_NAME:-qwen38-27b}
 image=${CUDA_IMAGE:-nvidia/cuda:12.8.1-cudnn-devel-ubuntu22.04}
 model_root=${MODEL_ROOT:-/home/wzu/models/Qwen3.8-27B-GGUF}
-bin_root=${BIN_ROOT:-$model_root/operator-ab-20260816/optimized/bin}
+bin_root=${BIN_ROOT:-$model_root/operator-subvocab-20260817/bin}
 host_port=${HOST_PORT:-8000}
 gpu=${GPU:-0}
+mtp_subvocab=${MTP_SUBVOCAB:-131072}
+
+docker_env_args=()
+if [[ "$mtp_subvocab" -gt 0 ]]; then
+    docker_env_args+=(-e "LLAMA_MTP_SUBVOCAB=$mtp_subvocab")
+fi
 
 if [[ ${TUNE_CLOCK:-1} == 1 ]]; then
     "$root/scripts/tune-v100-clock.sh" "$gpu"
@@ -20,6 +26,7 @@ docker run -d --name "$container" \
     -p "127.0.0.1:$host_port:8000" \
     --shm-size 4g \
     -e LD_LIBRARY_PATH=/opt/llama/bin:/usr/local/cuda/lib64 \
+    "${docker_env_args[@]}" \
     -v "$bin_root:/opt/llama/bin:ro" \
     -v "$model_root:/models:ro" \
     --entrypoint /opt/llama/bin/llama-server \

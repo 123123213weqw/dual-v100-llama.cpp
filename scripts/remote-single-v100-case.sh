@@ -20,10 +20,29 @@ context=${CONTEXT:-262144}
 mmproj=${MMPROJ:-0}
 prompt_file=${PROMPT_FILE:-$repo_root/benchmarks/prompts/short.txt}
 result_label=${RESULT_LABEL:-short}
+docker_gpus=${DOCKER_GPUS:-device=0}
+split_mode=${SPLIT_MODE:-none}
+main_gpu=${MAIN_GPU:-0}
+tensor_split=${TENSOR_SPLIT:-1,1}
 
 mmproj_args=()
 if [[ "$mmproj" == 1 ]]; then
     mmproj_args=(--mmproj /models/mmproj-F16.gguf)
+fi
+
+# Forward opt-in llama.cpp experiments without baking them into the image.
+# Empty values intentionally mean "disabled" so control and candidate cases can
+# use the same script and differ only in their exported environment.
+docker_env_args=()
+for env_name in LLAMA_SPEC_CHAIN LLAMA_SPEC_CHAIN_SUB LLAMA_SCHED_POOL LLAMA_MTP_SUBVOCAB; do
+    if [[ -n "${!env_name:-}" ]]; then
+        docker_env_args+=(-e "$env_name=${!env_name}")
+    fi
+done
+
+split_args=(--split-mode "$split_mode" --main-gpu "$main_gpu")
+if [[ "$split_mode" == tensor || "$split_mode" == layer || "$split_mode" == row ]]; then
+    split_args+=(--tensor-split "$tensor_split")
 fi
 
 mkdir -p "$root"
@@ -39,10 +58,11 @@ cleanup() {
 trap cleanup EXIT
 
 docker run -d --name "$container" \
-    --gpus device=0 \
+    --gpus "$docker_gpus" \
     -p 127.0.0.1:8000:8000 \
     --shm-size 4g \
     -e LD_LIBRARY_PATH=/opt/llama/bin:/usr/local/cuda/lib64 \
+    "${docker_env_args[@]}" \
     -v "$bin_root:/opt/llama/bin:ro" \
     -v "$model_root:/models:ro" \
     --entrypoint /opt/llama/bin/llama-server \
@@ -50,7 +70,7 @@ docker run -d --name "$container" \
     -m /models/Qwen3.8-27B-Q4_K_M.gguf \
     --alias qwen3.8-27b-q4-single \
     --host 0.0.0.0 --port 8000 \
-    -ngl all --split-mode none --main-gpu 0 --fit off \
+    -ngl all "${split_args[@]}" --fit off \
     -c "$context" --parallel 1 -b "$batch" -ub "$ubatch" \
     -fa on -ctk "$kv_type" -ctv "$kv_type" \
     --jinja --reasoning-format deepseek \

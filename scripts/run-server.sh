@@ -3,7 +3,7 @@ set -euo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 CONFIG=${CONFIG:-"$ROOT/config/qwen3.8-27b.env.example"}
-BUILD_DIR=${BUILD_DIR:-"$ROOT/.work/build-operator"}
+BUILD_DIR=${BUILD_DIR:-"$ROOT/.work/build-operator-subvocab"}
 
 if [[ ! -f "$CONFIG" ]]; then
     echo "config not found: $CONFIG" >&2
@@ -83,5 +83,8 @@ if [[ -n ${MMPROJ:-} ]]; then
 fi
 
 export CUDA_VISIBLE_DEVICES
+if [[ ${MTP_SUBVOCAB:-0} -gt 0 ]]; then
+    export LLAMA_MTP_SUBVOCAB="$MTP_SUBVOCAB"
+fi
 export LD_LIBRARY_PATH="$BUILD_DIR/bin${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 exec "$SERVER" "${ARGS[@]}" "$@"

@@ -8,6 +8,9 @@ The patch variants consolidate and forward-port work discussed upstream:
   serialize multi-ubatch MTP decode execution.
 - `llama.cpp` PR [#22587](https://github.com/ggml-org/llama.cpp/pull/22587):
   row-per-warp CUDA kernel for `GATED_DELTA_NET`.
+- `llama.cpp` PR [#27173](https://github.com/ggml-org/llama.cpp/pull/27173):
+  experimental chained MTP graphs and a reduced MTP proposal head. This lab
+  reuses only the proposal-head idea in the faster stock single-step MTP path.
 
 `operator.patch` forward-ports the GDN work to the recurrent-state rollback
 and fused-cache interface at the pinned revision. The original upstream

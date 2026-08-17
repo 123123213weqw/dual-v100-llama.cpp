@@ -14,3 +14,5 @@ operator-q4kv-mtp1	Q4_K_M	q4_0	1	off	on	512	off	40	384	42.710909	125.104328	2363
 operator-q8-mtp1-long-mmproj	Q4_K_M	q8_0	1	off	on	512	on	64810	192	20.236517	468.803954	29239
 operator-q4kv-mtp1-long-mmproj	Q4_K_M	q4_0	1	off	on	512	on	64810	226	21.847286	471.947326	25143
 operator-q4kv-mtp1-final-clock1380	Q4_K_M	q4_0	1	off	on	512	on	40	512	43.420311	127.083502	24771
+operator-subvocab-q4kv-mtp1-final	Q4_K_M	q4_0	1	off	on	512	on	40	512	44.201247	126.780692	24771
+operator-subvocab-q4kv-mtp1-255k	Q4_K_M	q4_0	1	off	on	512	on	255000	128	12.617260	224.352288	25145

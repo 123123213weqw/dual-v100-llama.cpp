@@ -8,12 +8,16 @@ source "$ROOT/upstream.lock"
 VARIANT=${1:-operator}
 DEST=${2:-"$ROOT/.work/llama.cpp-$VARIANT"}
 
+PATCHES=()
 case "$VARIANT" in
-    baseline) PATCH="" ;;
-    safe) PATCH="$ROOT/patches/safe.patch" ;;
-    operator) PATCH="$ROOT/patches/operator.patch" ;;
+    baseline) ;;
+    safe) PATCHES+=("$ROOT/patches/safe.patch") ;;
+    operator) PATCHES+=("$ROOT/patches/operator.patch") ;;
+    operator-subvocab)
+        PATCHES+=("$ROOT/patches/operator.patch" "$ROOT/patches/mtp-subvocab.patch")
+        ;;
     *)
-        echo "usage: $0 {baseline|safe|operator} [destination]" >&2
+        echo "usage: $0 {baseline|safe|operator|operator-subvocab} [destination]" >&2
         exit 2
         ;;
 esac
@@ -29,18 +33,23 @@ git clone --filter=blob:none --no-checkout "$LLAMA_CPP_REPO" "$DEST"
 git -C "$DEST" fetch --depth=1 origin "$LLAMA_CPP_COMMIT"
 git -C "$DEST" checkout --detach "$LLAMA_CPP_COMMIT"
 
-if [[ -n "$PATCH" ]]; then
-    git -C "$DEST" apply --check "$PATCH"
-    git -C "$DEST" apply "$PATCH"
-fi
+for patch in "${PATCHES[@]}"; do
+    git -C "$DEST" apply --check "$patch"
+    git -C "$DEST" apply "$patch"
+done
 
 patch_sha256() {
-    if [[ -z "$PATCH" ]]; then
+    if [[ ${#PATCHES[@]} -eq 0 ]]; then
         printf 'none'
-    elif command -v sha256sum >/dev/null 2>&1; then
-        sha256sum "$PATCH" | awk '{print $1}'
     else
-        shasum -a 256 "$PATCH" | awk '{print $1}'
+        local patch
+        for patch in "${PATCHES[@]}"; do
+            if command -v sha256sum >/dev/null 2>&1; then
+                sha256sum "$patch" | awk '{print $1}'
+            else
+                shasum -a 256 "$patch" | awk '{print $1}'
+            fi
+        done | paste -sd, -
     fi
 }
 

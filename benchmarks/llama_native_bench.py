@@ -26,19 +26,39 @@ def post_json(url: str, payload: dict[str, Any], timeout: float) -> dict[str, An
 
 
 def run_once(args: argparse.Namespace, prompt: str) -> dict[str, Any]:
-    payload = {
-        "prompt": prompt,
-        "n_predict": args.n_predict,
-        "temperature": args.temperature,
-        "seed": args.seed,
-        "cache_prompt": args.cache_prompt,
-        "stream": False,
-    }
+    if args.chat:
+        endpoint = "/v1/chat/completions"
+        payload = {
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": args.n_predict,
+            "temperature": args.temperature,
+            "seed": args.seed,
+            "cache_prompt": args.cache_prompt,
+            "stream": False,
+        }
+    else:
+        endpoint = "/completion"
+        payload = {
+            "prompt": prompt,
+            "n_predict": args.n_predict,
+            "temperature": args.temperature,
+            "seed": args.seed,
+            "cache_prompt": args.cache_prompt,
+            "stream": False,
+        }
     started = time.perf_counter()
-    response = post_json(f"{args.url.rstrip('/')}/completion", payload, args.timeout)
+    response = post_json(f"{args.url.rstrip('/')}{endpoint}", payload, args.timeout)
     wall_seconds = time.perf_counter() - started
     timings = response.get("timings") or {}
-    content = response.get("content", "")
+    if args.chat:
+        choice = (response.get("choices") or [{}])[0]
+        message = choice.get("message") or {}
+        # Thinking models expose most or all generated text separately.
+        content = (message.get("reasoning_content") or "") + (message.get("content") or "")
+        stop = choice.get("finish_reason")
+    else:
+        content = response.get("content", "")
+        stop = response.get("stop")
     return {
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         "wall_seconds": wall_seconds,
@@ -49,7 +69,7 @@ def run_once(args: argparse.Namespace, prompt: str) -> dict[str, Any]:
         "predicted_ms": timings.get("predicted_ms"),
         "predicted_per_second": timings.get("predicted_per_second"),
         "content_sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
-        "stop": response.get("stop"),
+        "stop": stop,
         "stopped_eos": response.get("stopped_eos"),
         "stopped_limit": response.get("stopped_limit"),
     }
@@ -65,6 +85,7 @@ def main() -> None:
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--cache-prompt", action="store_true")
+    parser.add_argument("--chat", action="store_true", help="benchmark /v1/chat/completions instead of /completion")
     parser.add_argument("--timeout", type=float, default=3600)
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()

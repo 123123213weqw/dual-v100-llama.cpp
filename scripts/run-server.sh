@@ -24,10 +24,14 @@ set +a
 : "${PARALLEL:=1}"
 : "${BATCH:=2048}"
 : "${UBATCH:=512}"
+: "${SPLIT_MODE:=tensor}"
+: "${MAIN_GPU:=0}"
 : "${TENSOR_SPLIT:=1,1}"
 : "${KV_TYPE_K:=f16}"
 : "${KV_TYPE_V:=f16}"
+: "${SPEC_TYPE:=draft-mtp}"
 : "${SPEC_DRAFT_MAX:=3}"
+: "${SPEC_DRAFT_BACKEND_SAMPLING:=off}"
 
 SERVER="$BUILD_DIR/bin/llama-server"
 if [[ ! -x "$SERVER" ]]; then
@@ -41,8 +45,7 @@ ARGS=(
     --host "$HOST"
     --port "$PORT"
     -ngl all
-    --split-mode tensor
-    --tensor-split "$TENSOR_SPLIT"
+    --split-mode "$SPLIT_MODE"
     --fit off
     -c "$CONTEXT"
     --parallel "$PARALLEL"
@@ -53,10 +56,27 @@ ARGS=(
     -ctv "$KV_TYPE_V"
     --jinja
     --reasoning-format deepseek
-    --spec-type draft-mtp
-    --spec-draft-n-max "$SPEC_DRAFT_MAX"
-    --no-spec-draft-backend-sampling
 )
+
+if [[ "$SPLIT_MODE" == tensor ]]; then
+    ARGS+=(--tensor-split "$TENSOR_SPLIT")
+else
+    ARGS+=(--main-gpu "$MAIN_GPU")
+fi
+
+if [[ "$SPEC_TYPE" != none ]]; then
+    ARGS+=(--spec-type "$SPEC_TYPE" --spec-draft-n-max "$SPEC_DRAFT_MAX")
+fi
+
+case "$SPEC_DRAFT_BACKEND_SAMPLING" in
+    on)   ARGS+=(--spec-draft-backend-sampling) ;;
+    off)  ARGS+=(--no-spec-draft-backend-sampling) ;;
+    auto) ;;
+    *)
+        echo "SPEC_DRAFT_BACKEND_SAMPLING must be on, off, or auto" >&2
+        exit 1
+        ;;
+esac
 
 if [[ -n ${MMPROJ:-} ]]; then
     ARGS+=(--mmproj "$MMPROJ")

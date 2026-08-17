@@ -1,0 +1,16 @@
+case	weight	kv	mtp_max	backend_sampling	draft_backend	ubatch	mmproj	prompt_tokens	generation_tokens	decode_tok_s	prefill_tok_s	peak_mib
+base-q8-mtp3	Q4_K_M	q8_0	3	off	on	512	off	40	384	37.996557	124.071822	28063
+safe-q8-mtp3	Q4_K_M	q8_0	3	off	on	512	off	40	384	37.729925	124.191870	28063
+operator-q8-mtp3	Q4_K_M	q8_0	3	off	on	512	off	40	384	38.859945	124.536871	28063
+operator-q8-none	Q4_K_M	q8_0	0	off	auto	512	off	40	384	30.570338	144.772102	25949
+operator-q8-mtp1	Q4_K_M	q8_0	1	off	on	512	off	40	384	41.926230	124.529348	27731
+operator-q8-mtp2	Q4_K_M	q8_0	2	off	on	512	off	40	384	40.379569	123.432964	27881
+operator-q8-mtp4	Q4_K_M	q8_0	4	off	on	512	off	40	384	34.479925	123.054749	28215
+operator-q8-mtp5	Q4_K_M	q8_0	5	off	on	512	off	40	384	30.269239	123.263318	28363
+operator-q8-mtp3-draft-backend-off	Q4_K_M	q8_0	3	off	off	512	off	40	384	37.034770	122.171617	28063
+operator-q4kv-none	Q4_K_M	q4_0	0	off	auto	512	off	40	384	31.646962	144.016647	21853
+safe-q4kv-mtp1	Q4_K_M	q4_0	1	off	on	512	off	40	384	40.975567	125.838878	23635
+operator-q4kv-mtp1	Q4_K_M	q4_0	1	off	on	512	off	40	384	42.710909	125.104328	23635
+operator-q8-mtp1-long-mmproj	Q4_K_M	q8_0	1	off	on	512	on	64810	192	20.236517	468.803954	29239
+operator-q4kv-mtp1-long-mmproj	Q4_K_M	q4_0	1	off	on	512	on	64810	226	21.847286	471.947326	25143
+operator-q4kv-mtp1-final-clock1380	Q4_K_M	q4_0	1	off	on	512	on	40	512	43.420311	127.083502	24771

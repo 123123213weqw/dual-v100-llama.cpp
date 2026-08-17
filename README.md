@@ -10,6 +10,8 @@ reviewable patch variants, and makes every performance claim reproducible.
 
 [中文实验报告](docs/benchmark-2026-08-16.zh-CN.md)
 
+[单张 V100 极限解码报告](docs/benchmark-single-v100-2026-08-17.zh-CN.md)
+
 ## Current result
 
 Validated on 2x V100 with tensor split `1,1`, context `262144`, parallel `1`,
@@ -26,6 +28,21 @@ The operator variant improves decode by `0.48%` on the short case and `1.09%`
 at 71K context. Q8_0 KV saves about `2.8 GiB` per GPU but is slower at long
 context, so F16 KV remains the production default. Raw summary data lives in
 [`results/summary-2026-08-16.tsv`](results/summary-2026-08-16.tsv).
+
+### Single-V100 throughput profile
+
+The Qwen3.8-27B `Q4_K_M` single-GPU profile keeps the full 262K context and
+multimodal projector while leaving GPU1 idle. With Q4_0 KV, MTP draft length 1,
+and V100 application clocks fixed at 1380 MHz, it reaches **43.420 tok/s** on
+the 512-token short test and **21.847 tok/s** after a 64,810-token prompt.
+Use [`config/qwen3.8-27b-single-v100.env.example`](config/qwen3.8-27b-single-v100.env.example)
+and see the linked report for the quality/performance trade-offs.
+
+On the validated server, reproduce the deployed Docker profile with:
+
+```bash
+./scripts/deploy-single-v100-docker.sh
+```
 
 ## Patch variants
 

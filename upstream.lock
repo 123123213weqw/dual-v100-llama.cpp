@@ -1,0 +1,6 @@
+# Reproducible llama.cpp baseline used by the validated 2x V100 build.
+LLAMA_CPP_REPO=https://github.com/ggml-org/llama.cpp.git
+LLAMA_CPP_COMMIT=ad1de39e0708e3ced9c71bb3c82d93a2c046a73f
+
+# Informational only: latest upstream revision inspected on 2026-08-17.
+LLAMA_CPP_LATEST_VERIFIED=4df29be4f4c3673f428170fda944a5b19f743bb8

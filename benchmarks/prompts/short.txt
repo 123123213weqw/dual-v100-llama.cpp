@@ -1,0 +1,3 @@
+Explain why a two-GPU tensor-parallel language model can become latency-bound
+by synchronization and memory bandwidth during single-token decoding. Give a
+concise technical answer with a measurement plan.

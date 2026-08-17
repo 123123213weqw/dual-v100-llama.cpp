@@ -1,0 +1,22 @@
+{
+  "upstream": {
+    "repository": "https://github.com/ggml-org/llama.cpp",
+    "commit": "ad1de39e0708e3ced9c71bb3c82d93a2c046a73f"
+  },
+  "variants": {
+    "safe": {
+      "file": "safe.patch",
+      "sha256": "a6253d37efe24158f4404901d9a52ce7be4f8bb7455f594bfa77ce695475ed67",
+      "components": ["argmax-multiblock", "mtp-multi-ubatch-serialization"]
+    },
+    "operator": {
+      "file": "operator.patch",
+      "sha256": "3303d9174a7699c5f08729c7edc5d6ba96e78cb71c18294cdc7f2ff723b691b9",
+      "components": [
+        "argmax-multiblock",
+        "mtp-multi-ubatch-serialization",
+        "gated-delta-net-row-per-warp"
+      ]
+    }
+  }
+}

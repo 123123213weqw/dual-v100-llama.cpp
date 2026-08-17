@@ -1,0 +1,17 @@
+name: patch-check
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify patches against pinned upstream
+        run: ./scripts/check-patches.sh

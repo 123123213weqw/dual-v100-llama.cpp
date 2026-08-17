@@ -1,0 +1,10 @@
+name	variant	kv	context	prompt_n	prompt_tps	decode_tps	gpu_mem_mib_each	content_sha256
+base_f16	master-base	f16	short	78	164.339	57.400	23665	6d992a419f768eebca9ec0c8772f9e0b68bf52debb5de7a4eb89ba30fd6b826f
+safe_f16	safe	f16	short	78	163.900	57.303	23665	6d992a419f768eebca9ec0c8772f9e0b68bf52debb5de7a4eb89ba30fd6b826f
+opt_f16	operator	f16	short	78	164.500	57.677	23665	fcd0f9fcc5f3fc532b2997987c4ecc94a0541e23f1820dfbdb7eb08a7cda3d3a
+base_q8	master-base	q8_0	short	78	163.045	55.836	20809	50c9f93e079d0720fa964c3550bc2991a4504baa5bafb054e87243c8ece5c6df
+opt_q8	operator	q8_0	short	78	157.120	56.645	20809	fcd0f9fcc5f3fc532b2997987c4ecc94a0541e23f1820dfbdb7eb08a7cda3d3a
+base_f16_long	master-base	f16	71k	71351	655.332	61.747	23735	-
+opt_f16_long	operator	f16	71k	71351	652.111	62.421	23735	-
+base_q8_long	master-base	q8_0	71k	71351	655.350	57.355	20879	-
+opt_q8_long	operator	q8_0	71k	71351	643.497	55.282	20879	-

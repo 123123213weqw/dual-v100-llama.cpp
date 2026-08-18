@@ -13,6 +13,8 @@ container=${CONTAINER_NAME:-qwen38-q4-single-ab}
 n_predict=${N_PREDICT:-384}
 runs=${RUNS:-2}
 warmup=${WARMUP:-1}
+settle_seconds=${SETTLE_SECONDS:-0}
+between_run_seconds=${BETWEEN_RUN_SECONDS:-0}
 batch=${BATCH:-2048}
 ubatch=${UBATCH:-512}
 kv_type=${KV_TYPE:-q8_0}
@@ -20,10 +22,16 @@ context=${CONTEXT:-262144}
 mmproj=${MMPROJ:-0}
 prompt_file=${PROMPT_FILE:-$repo_root/benchmarks/prompts/short.txt}
 result_label=${RESULT_LABEL:-short}
+cache_prompt=${CACHE_PROMPT:-0}
 docker_gpus=${DOCKER_GPUS:-device=0}
 split_mode=${SPLIT_MODE:-none}
 main_gpu=${MAIN_GPU:-0}
 tensor_split=${TENSOR_SPLIT:-1,1}
+
+cache_args=()
+if [[ "$cache_prompt" == 1 ]]; then
+    cache_args+=(--cache-prompt)
+fi
 
 mmproj_args=()
 if [[ "$mmproj" == 1 ]]; then
@@ -98,7 +106,7 @@ done
 (
     while docker inspect -f '{{.State.Running}}' "$container" 2>/dev/null | grep -q true; do
         printf '%s,' "$(date +%s)"
-        nvidia-smi --query-gpu=index,memory.used,utilization.gpu,utilization.memory,power.draw,clocks.sm,clocks.mem \
+        nvidia-smi --query-gpu=index,memory.used,utilization.gpu,utilization.memory,power.draw,clocks.sm,clocks.mem,temperature.gpu,clocks_throttle_reasons.sw_power_cap \
             --format=csv,noheader,nounits | sed -n '1p'
         sleep 1
     done
@@ -109,7 +117,10 @@ python3 "$repo_root/benchmarks/llama_native_bench.py" \
     --url http://127.0.0.1:8000 \
     --prompt-file "$prompt_file" \
     --n-predict "$n_predict" --warmup "$warmup" --runs "$runs" \
+    --settle-seconds "$settle_seconds" \
+    --between-run-seconds "$between_run_seconds" \
     --temperature 0 --seed 1 \
+    "${cache_args[@]}" \
     --output "$root/$case_name.$result_label.jsonl" \
     | tee "$root/$case_name.$result_label.out"
 

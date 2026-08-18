@@ -82,6 +82,18 @@ def main() -> None:
     parser.add_argument("--n-predict", type=int, default=512)
     parser.add_argument("--runs", type=int, default=3)
     parser.add_argument("--warmup", type=int, default=1)
+    parser.add_argument(
+        "--settle-seconds",
+        type=float,
+        default=0.0,
+        help="sleep after warmup before recording the first run",
+    )
+    parser.add_argument(
+        "--between-run-seconds",
+        type=float,
+        default=0.0,
+        help="sleep between recorded runs to reduce thermal/order bias",
+    )
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--cache-prompt", action="store_true")
@@ -93,9 +105,13 @@ def main() -> None:
     prompt = args.prompt_file.read_text(encoding="utf-8")
     for _ in range(args.warmup):
         run_once(args, prompt)
+    if args.warmup and args.settle_seconds > 0:
+        time.sleep(args.settle_seconds)
 
     results = []
     for index in range(args.runs):
+        if index and args.between_run_seconds > 0:
+            time.sleep(args.between_run_seconds)
         result = run_once(args, prompt)
         result["run"] = index + 1
         results.append(result)

@@ -16,8 +16,15 @@ case "$VARIANT" in
     operator-subvocab)
         PATCHES+=("$ROOT/patches/operator.patch" "$ROOT/patches/mtp-subvocab.patch")
         ;;
+    operator-subvocab-tuning)
+        PATCHES+=(
+            "$ROOT/patches/operator.patch"
+            "$ROOT/patches/mtp-subvocab.patch"
+            "$ROOT/patches/sm70-tuning.patch"
+        )
+        ;;
     *)
-        echo "usage: $0 {baseline|safe|operator|operator-subvocab} [destination]" >&2
+        echo "usage: $0 {baseline|safe|operator|operator-subvocab|operator-subvocab-tuning} [destination]" >&2
         exit 2
         ;;
 esac
@@ -29,8 +36,18 @@ if [[ -e "$DEST" ]]; then
 fi
 
 mkdir -p "$(dirname "$DEST")"
-git clone --filter=blob:none --no-checkout "$LLAMA_CPP_REPO" "$DEST"
-git -C "$DEST" fetch --depth=1 origin "$LLAMA_CPP_COMMIT"
+if [[ -n "${LLAMA_CPP_MIRROR:-}" ]]; then
+    if ! git -C "$LLAMA_CPP_MIRROR" rev-parse --git-dir >/dev/null 2>&1; then
+        echo "LLAMA_CPP_MIRROR is not a git repository: $LLAMA_CPP_MIRROR" >&2
+        exit 1
+    fi
+    git clone --no-hardlinks --no-checkout "$LLAMA_CPP_MIRROR" "$DEST"
+else
+    git clone --filter=blob:none --no-checkout "$LLAMA_CPP_REPO" "$DEST"
+fi
+if ! git -C "$DEST" cat-file -e "$LLAMA_CPP_COMMIT^{commit}" 2>/dev/null; then
+    git -C "$DEST" fetch --depth=1 origin "$LLAMA_CPP_COMMIT"
+fi
 git -C "$DEST" checkout --detach "$LLAMA_CPP_COMMIT"
 
 for patch in "${PATCHES[@]}"; do

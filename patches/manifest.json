@@ -7,7 +7,10 @@
     "safe": {
       "file": "safe.patch",
       "sha256": "a6253d37efe24158f4404901d9a52ce7be4f8bb7455f594bfa77ce695475ed67",
-      "components": ["argmax-multiblock", "mtp-multi-ubatch-serialization"]
+      "components": [
+        "argmax-multiblock",
+        "mtp-multi-ubatch-serialization"
+      ]
     },
     "operator": {
       "file": "operator.patch",
@@ -19,7 +22,10 @@
       ]
     },
     "operator-subvocab": {
-      "files": ["operator.patch", "mtp-subvocab.patch"],
+      "files": [
+        "operator.patch",
+        "mtp-subvocab.patch"
+      ],
       "sha256": [
         "3303d9174a7699c5f08729c7edc5d6ba96e78cb71c18294cdc7f2ff723b691b9",
         "29c0fcfe063a4255cd2ac03f22d6f41500b53a8bd70cc5088a85f1b9f1024c57"
@@ -29,6 +35,27 @@
         "mtp-multi-ubatch-serialization",
         "gated-delta-net-row-per-warp",
         "qwen35-mtp-subvocab"
+      ]
+    },
+    "operator-subvocab-tuning": {
+      "files": [
+        "operator.patch",
+        "mtp-subvocab.patch",
+        "sm70-tuning.patch"
+      ],
+      "sha256": [
+        "3303d9174a7699c5f08729c7edc5d6ba96e78cb71c18294cdc7f2ff723b691b9",
+        "29c0fcfe063a4255cd2ac03f22d6f41500b53a8bd70cc5088a85f1b9f1024c57",
+        "eb6273b3156c82ca4fa90d02320e8ee72849f0a7aa10087987d9c75ccb7fdf02"
+      ],
+      "components": [
+        "argmax-multiblock",
+        "mtp-multi-ubatch-serialization",
+        "gated-delta-net-row-per-warp",
+        "qwen35-mtp-subvocab",
+        "sm70-fattn-vec-launch-tuning",
+        "sm70-fattn-gqa-head-grouping",
+        "sm70-gdn-launch-tuning"
       ]
     }
   }

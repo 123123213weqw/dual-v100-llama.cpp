@@ -17,13 +17,40 @@ else
 fi
 JOBS=${JOBS:-$DEFAULT_JOBS}
 
-cmake -S "$SOURCE_DIR" -B "$BUILD_DIR" \
-    -DCMAKE_BUILD_TYPE=Release \
-    -DCMAKE_CUDA_ARCHITECTURES=70 \
-    -DGGML_CUDA=ON \
-    -DGGML_NATIVE=OFF \
-    -DBUILD_SHARED_LIBS=ON \
+CUDA_FLAGS=${CMAKE_CUDA_FLAGS:-}
+append_cuda_define() {
+    local name=$1
+    local value=${!name:-}
+    if [[ -z "$value" ]]; then
+        return
+    fi
+    if [[ ! "$value" =~ ^[1-9][0-9]*$ ]]; then
+        echo "$name must be a positive integer, got: $value" >&2
+        exit 2
+    fi
+    CUDA_FLAGS+=" -D${name}=${value}"
+}
+
+append_cuda_define GGML_CUDA_FATTN_VEC_NTHREADS
+append_cuda_define GGML_CUDA_FATTN_VEC_MIN_BLOCKS
+append_cuda_define GGML_CUDA_FATTN_VEC_GQA_HEADS
+append_cuda_define GGML_CUDA_GDN_NUM_WARPS
+append_cuda_define GGML_CUDA_GDN_DV_PER_WARP
+
+CMAKE_ARGS=(
+    -DCMAKE_BUILD_TYPE=Release
+    -DCMAKE_CUDA_ARCHITECTURES=70
+    -DGGML_CUDA=ON
+    -DGGML_NATIVE=OFF
+    -DBUILD_SHARED_LIBS=ON
     -DLLAMA_BUILD_TESTS=ON
+)
+if [[ -n "${CUDA_FLAGS// }" ]]; then
+    CMAKE_ARGS+=("-DCMAKE_CUDA_FLAGS=$CUDA_FLAGS")
+fi
+
+cmake -S "$SOURCE_DIR" -B "$BUILD_DIR" \
+    "${CMAKE_ARGS[@]}"
 
 cmake --build "$BUILD_DIR" --parallel "$JOBS" \
     --target llama-server test-backend-ops

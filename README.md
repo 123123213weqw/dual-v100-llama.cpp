@@ -12,6 +12,8 @@ reviewable patch variants, and makes every performance claim reproducible.
 
 [单张 V100 极限解码报告](docs/benchmark-single-v100-2026-08-17.zh-CN.md)
 
+[单张 V100 SM70 内核调优报告](docs/benchmark-sm70-tuning-2026-08-18.zh-CN.md)
+
 ## Current result
 
 Validated on 2x V100 with tensor split `1,1`, context `262144`, parallel `1`,
@@ -36,11 +38,19 @@ multimodal projector while leaving GPU1 idle. With Q4_0 KV, MTP draft length 1,
 a 131,072-token MTP proposal vocabulary, and V100 application clocks fixed at
 1380 MHz, it reaches **44.201 tok/s** on the 512-token short test. The proposal
 head optimization improved an isolated 64,810-token A/B from `27.530` to
-`27.802 tok/s`; target verification still uses the complete vocabulary. An
-actual 255,000-token capacity run completed at `12.617 tok/s` decode with
-`25,145 MiB` peak VRAM.
+`27.802 tok/s`; target verification still uses the complete vocabulary. The
+SM70 GQA×2 kernel pass increased an actual 255,000-token capacity run from
+`12.617` to **`13.001 tok/s`** (`+3.04%`) with `25,145 MiB` peak VRAM.
 Use [`config/qwen3.8-27b-single-v100.env.example`](config/qwen3.8-27b-single-v100.env.example)
 and see the linked report for the quality/performance trade-offs.
+
+The 2026-08-18 SM70 pass added a two-query-head GQA Flash Attention path. At
+64,810 tokens it improved a clock-controlled adjacent A/B from `28.017` to
+`28.153 tok/s` (`+0.49%`), and at 255,000 tokens from `12.617` to
+`13.001 tok/s` (`+3.04%`). Output hashes, MTP acceptance, and peak VRAM were
+identical. The validated single-V100 deployment enables it at build time with
+`GGML_CUDA_FATTN_VEC_GQA_HEADS=2`; the previous one-head binary remains the
+rollback artifact.
 
 On the validated server, reproduce the deployed Docker profile with:
 
@@ -63,6 +73,10 @@ On the validated server, reproduce the deployed Docker profile with:
     sampling;
   - enabled with `LLAMA_MTP_SUBVOCAB=131072` in the deployed single-V100
     profile.
+- [`patches/sm70-tuning.patch`](patches/sm70-tuning.patch)
+  - compile-time FA/GDN launch geometry controls for reproducible SM70 A/B;
+  - optional two-query-head GQA vector-attention path that reuses each
+    dequantized V row without changing per-head QK or softmax semantics.
 
 The safe variant produced byte-identical 512-token output versus the pinned
 baseline. The operator variant changes floating-point reduction order, so its
@@ -88,6 +102,13 @@ Remote build from a workstation:
 
 ```bash
 REMOTE=WZU_Server ./scripts/remote-build.sh operator-subvocab
+```
+
+Build the opt-in SM70 GQA×2 candidate in an isolated remote directory:
+
+```bash
+GGML_CUDA_FATTN_VEC_GQA_HEADS=2 \
+  REMOTE=WZU_Server ./scripts/remote-build.sh operator-subvocab-tuning
 ```
 
 Benchmark the native llama.cpp endpoint:

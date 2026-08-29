@@ -1,0 +1,58 @@
+{
+  "deployed_at": "2026-08-20T12:47:50+08:00",
+  "production_container": {
+    "name": "qwen38-27b",
+    "id": "96915f518bee1043a59e692ef6f0ab92d259165318c6893b427755fa57c8f4a2",
+    "engine_label": "v100-x1-fullopt-20deb624",
+    "health": "healthy",
+    "release_bin": "/home/wzu/v100-x1/releases/20260820-fullopt-20deb624/bin",
+    "release_manifest_sha256": "1193d168e64f83304313bd91858b0fd2b955c38dbd839062b2c5232a10b1c295"
+  },
+  "rollback_container": {
+    "name": "qwen38-27b-rollback-pre-fullopt-20260820",
+    "id": "ccc2170d2a461809b045cc0f5a531aef677c7f4ba5a3c16b15340d861094d727",
+    "state": "exited"
+  },
+  "winning_environment": {
+    "LLAMA_MTP_CANDIDATE_K": "1",
+    "LLAMA_MTP_DEFER_VERIFY": "1",
+    "LLAMA_MTP_DEFER_VERIFY_MIN_POS": "32768",
+    "LLAMA_EXPERIMENTAL_TP_BACKEND_SAMPLING": "1",
+    "LLAMA_EXPERIMENTAL_TP_LOCAL_TOPK": "1",
+    "LLAMA_EXPERIMENTAL_TP_LOCAL_TOPK_K": "1",
+    "LLAMA_EXPERIMENTAL_MTP_MIRROR_LAYER": "0",
+    "GGML_META_ASYNC_HOST_COPY": "1",
+    "GGML_META_PARALLEL_LAUNCH": "1"
+  },
+  "qualification": {
+    "maintenance_ab_run": "maintenance-ab-fullopt0820r2",
+    "tuning_runs": [
+      "maintenance-ab-mtpk1r3",
+      "maintenance-ab-mtpdeferr4",
+      "maintenance-ab-mtpmirrorr5",
+      "maintenance-ab-asynccopyr6",
+      "maintenance-ab-parlaunchr7"
+    ],
+    "legacy_71351_token_hash_match": true,
+    "grammar_tool_passed": true,
+    "continuation_cache_passed": true,
+    "fatal_position_or_decode_errors": 0
+  },
+  "production_smoke": {
+    "prompt_tokens": 32770,
+    "generated_tokens": 128,
+    "prompt_tokens_per_second": 1159.1855,
+    "decode_tokens_per_second": 68.7537,
+    "draft_tokens": 108,
+    "accepted_draft_tokens": 90,
+    "mtp_acceptance": 0.8333333,
+    "token_ids_le_i32_sha256": "606d45e326b43f158b2a1edabb8693cb29db8adae420faa1d10a40321bec33cf"
+  },
+  "network": {
+    "direct_health": 200,
+    "metrics": 200,
+    "tokyo_tunnel_health": 200,
+    "public_unauthenticated_health": 401,
+    "caddyfile_sha256": "e3eb366061ad5736894f020aecde3063bed211e7094384ecd28b777dca4aee25"
+  }
+}

@@ -1,0 +1,175 @@
+{
+  "audit_window_utc": "2026-08-20T03:29:22Z/2026-08-20T03:31:59Z",
+  "mode": "read-only",
+  "wzu": {
+    "host": "wzu-SYS-4029GP-TRT",
+    "kernel": "Linux 6.8.0-136-generic x86_64",
+    "container": {
+      "name": "qwen38-27b",
+      "id": "ccc2170d2a461809b045cc0f5a531aef677c7f4ba5a3c16b15340d861094d727",
+      "image_id": "sha256:07247b31345790c74ee47631ce792dd1183a4e83ec7bccec240c1708e53b3a1f",
+      "image": "nvidia/cuda:12.8.1-cudnn-devel-ubuntu22.04",
+      "created": "2026-08-19T23:43:48.72311316Z",
+      "started": "2026-08-19T23:43:48.740538183Z",
+      "status": "running",
+      "health": "healthy",
+      "pid": 978202,
+      "restart_policy": "unless-stopped",
+      "ipc_mode": "host",
+      "cap_add": [
+        "CAP_SYS_NICE"
+      ],
+      "gpu_request": "all",
+      "host_binding": "127.0.0.1:8000->8000/tcp",
+      "network_mode": "bridge",
+      "container_ip": "172.17.0.3",
+      "entrypoint": "/opt/llama/bin/llama-server",
+      "args": [
+        "-m",
+        "/uncensored/Qwen3.8-27B-Uncensored-Q8_0.gguf",
+        "--alias",
+        "qwen3.8-27b-uncensored",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        "8000",
+        "-ngl",
+        "all",
+        "--split-mode",
+        "tensor",
+        "--tensor-split",
+        "1,1",
+        "--fit",
+        "off",
+        "-c",
+        "262144",
+        "--parallel",
+        "1",
+        "-b",
+        "4096",
+        "-ub",
+        "2048",
+        "-fa",
+        "on",
+        "-ctk",
+        "f16",
+        "-ctv",
+        "f16",
+        "--jinja",
+        "--reasoning-format",
+        "deepseek",
+        "--mmproj",
+        "/uncensored/Qwen3.8-27B-Uncensored-vision-f16.gguf",
+        "--spec-type",
+        "draft-mtp",
+        "--spec-draft-n-max",
+        "3",
+        "--spec-draft-backend-sampling",
+        "-bs"
+      ],
+      "custom_env": {
+        "LD_LIBRARY_PATH": "/opt/llama/bin:/usr/local/cuda/lib64",
+        "GGML_CUDA_ALLREDUCE": "hybrid",
+        "GGML_CUDA_ALLREDUCE_HYBRID_MAX_ELEMS": "131072",
+        "GGML_CUDA_AR_KERNEL_BLOCKS": "3",
+        "GGML_CUDA_AR_F16_WIRE": "1",
+        "NCCL_MIN_NCHANNELS": "8",
+        "NCCL_MAX_NCHANNELS": "8",
+        "NCCL_NTHREADS": "512",
+        "LLAMA_MTP_DEFER_VERIFY": "1",
+        "LLAMA_MTP_DEFER_VERIFY_MIN_POS": "32768",
+        "LLAMA_EXPERIMENTAL_TP_BACKEND_SAMPLING": "1",
+        "LLAMA_EXPERIMENTAL_TP_LOCAL_TOPK": "1",
+        "LLAMA_EXPERIMENTAL_TP_LOCAL_TOPK_K": "20",
+        "GGML_META_PARALLEL_LAUNCH": "1"
+      },
+      "mounts": [
+        "/home/wzu/v100-x1/releases/20260820-operator-ab-131b7b57/bin:/opt/llama/bin:ro",
+        "/home/wzu/models/Qwen3.8-27B-GGUF:/official:ro",
+        "/home/wzu/models/Qwen3.8-27B-Uncensored-GGUF:/uncensored:ro"
+      ],
+      "healthcheck": "timeout 5 bash -c \"</dev/tcp/127.0.0.1/8000\"",
+      "health_interval_seconds": 30,
+      "health_timeout_seconds": 10,
+      "health_start_period_seconds": 180,
+      "health_retries": 3
+    },
+    "api": {
+      "health_http_status": 200,
+      "slots_http_status": 200,
+      "metrics_http_status": 501,
+      "slot": {
+        "id": 0,
+        "n_ctx": 262144,
+        "speculative": true,
+        "is_processing": false,
+        "n_prompt_tokens": 110855,
+        "chat_format": "peg-native",
+        "reasoning_format": "deepseek",
+        "speculative_types": "none,draft-mtp"
+      }
+    },
+    "gpus": [
+      {
+        "index": 0,
+        "name": "Tesla V100-PCIE-32GB",
+        "uuid": "GPU-18fbf081-3c6d-d65b-11b8-288a4ce1ab28",
+        "driver": "580.173.02",
+        "memory_total_mib": 32768,
+        "memory_used_mib": 27233,
+        "compute_pid": 978202
+      },
+      {
+        "index": 1,
+        "name": "Tesla V100-PCIE-32GB",
+        "uuid": "GPU-f65db2e8-87bb-c88d-363f-23c79f793548",
+        "driver": "580.173.02",
+        "memory_total_mib": 32768,
+        "memory_used_mib": 26097,
+        "compute_pid": 978202
+      }
+    ],
+    "gpu_link": "NODE",
+    "gpu_cpu_affinity": "0-15,32-47",
+    "gpu_numa_node": 0,
+    "root_disk": {
+      "filesystem": "/dev/sda3",
+      "type": "ext4",
+      "size": "1.8T",
+      "used": "664G",
+      "available": "1006G",
+      "use_percent": 40,
+      "inode_use_percent": 7
+    },
+    "release": {
+      "bin_manifest_sha256": "e88e1f8294495bf35eecfca15c404c77ce4cac3e06aa1c0759401a9a241351f7",
+      "llama_server_sha256": "eac368769551851537cb9d8165b521b341854f8672e35c94bf2660e6751e5a4f",
+      "libggml_cuda_sha256": "b305d58d7476f29551f990a372fad5b3215662166068024d4121154991f33396",
+      "host_missing_dynamic_libraries": [
+        "libcudart.so.12",
+        "libcublas.so.12",
+        "libnccl.so.2"
+      ]
+    }
+  },
+  "gateway": {
+    "public_url": "https://api.47.245.37.106.nip.io/v1",
+    "public_unauthenticated_status": 401,
+    "haproxy_sni_frontend": "*:443",
+    "caddy_site": "https://api.47.245.37.106.nip.io:8444",
+    "caddy_service": "active",
+    "haproxy_service": "active",
+    "authorization": "exact Authorization Bearer header match; secret not read",
+    "tokyo_upstream": "127.0.0.1:18000",
+    "tokyo_upstream_health_status": 200,
+    "reverse_tunnel": {
+      "unit": "qwen-tokyo-tunnel.service",
+      "state": "active/running",
+      "restart": "always",
+      "restart_seconds": 5,
+      "wzu_forward": "-R 127.0.0.1:18000:127.0.0.1:8000",
+      "remote": "root@47.245.37.106"
+    }
+  },
+  "mutations_performed": []
+}

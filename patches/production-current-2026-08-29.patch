@@ -1,0 +1,3958 @@
+diff --git a/common/sampling.cpp b/common/sampling.cpp
+index 06dea1e..09cf40f 100644
+--- a/common/sampling.cpp
++++ b/common/sampling.cpp
+@@ -506,8 +506,8 @@ void common_sampler_reset(struct common_sampler * gsmpl) {
+     gsmpl->reset();
+ }
+ 
+-struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
+-    return new common_sampler {
++struct common_sampler * common_sampler_clone(const common_sampler * gsmpl) {
++    auto * result = new common_sampler {
+         /* .params  = */ gsmpl->params,
+         /* .grmr    = */ llama_sampler_clone(gsmpl->grmr),
+         /* .rbudget = */ llama_sampler_clone(gsmpl->rbudget),
+@@ -516,6 +516,12 @@ struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
+         /* .cur     = */ gsmpl->cur,
+         /* .cur_p   = */ gsmpl->cur_p,
+     };
++
++    // cur_p is a non-owning view into cur. The aggregate copy above preserves
++    // the source pointer, so rebind it to the cloned candidate buffer.
++    result->cur_p.data = gsmpl->cur_p.data ? result->cur.data() : nullptr;
++
++    return result;
+ }
+ 
+ void common_sampler_copy(const common_sampler * src, common_sampler * dst) {
+@@ -523,6 +529,20 @@ void common_sampler_copy(const common_sampler * src, common_sampler * dst) {
+         return;
+     }
+ 
++    common_sampler_copy_state(src, dst);
++
++    dst->params     = src->params;
++    dst->cur        = src->cur;
++    dst->cur_p      = src->cur_p;
++    dst->cur_p.data = src->cur_p.data ? dst->cur.data() : nullptr; // re-point to dst's buffer
++    dst->t_total_us = src->t_total_us;
++}
++
++void common_sampler_copy_state(const common_sampler * src, common_sampler * dst) {
++    if (!src || !dst || src == dst) {
++        return;
++    }
++
+     GGML_ASSERT((src->grmr == nullptr) == (dst->grmr == nullptr));
+     GGML_ASSERT((src->rbudget == nullptr) == (dst->rbudget == nullptr));
+ 
+@@ -530,12 +550,7 @@ void common_sampler_copy(const common_sampler * src, common_sampler * dst) {
+     llama_sampler_copy(src->rbudget, dst->rbudget);
+     llama_sampler_copy(src->chain,   dst->chain);
+ 
+-    dst->params     = src->params;
+     dst->prev       = src->prev;
+-    dst->cur        = src->cur;
+-    dst->cur_p      = src->cur_p;
+-    dst->cur_p.data = src->cur_p.data ? dst->cur.data() : nullptr; // re-point to dst's buffer
+-    dst->t_total_us = src->t_total_us;
+ }
+ 
+ void common_perf_print(const struct llama_context * ctx, const struct common_sampler * gsmpl) {
+@@ -592,9 +607,9 @@ struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl) {
+ }
+ 
+ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first) {
+-    llama_synchronize(ctx);
++    gsmpl->set_logits(ctx, idx);
+ 
+-    // start measuring sampling time after the llama_context synchronization in order to not measure any ongoing async operations
++    // Start measuring after the first output accessor has synchronized the backend.
+     const auto tm = gsmpl->tm();
+ 
+     llama_token id = LLAMA_TOKEN_NULL;
+@@ -604,8 +619,6 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
+     auto & chain = gsmpl->chain;
+     auto & cur_p = gsmpl->cur_p; // initialized by set_logits
+ 
+-    gsmpl->set_logits(ctx, idx);
+-
+     // Check if a backend sampler has already sampled a token in which case we
+     // return that token id directly.
+     {
+@@ -675,6 +688,84 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
+     return id;
+ }
+ 
++llama_token common_sampler_sample_from_candidates(
++        struct common_sampler * gsmpl,
++        const llama_token_data_array & candidates,
++        bool grammar_first) {
++    if (!gsmpl || candidates.size == 0) {
++        return LLAMA_TOKEN_NULL;
++    }
++
++    const auto tm = gsmpl->tm();
++
++    auto & grmr    = gsmpl->grmr;
++    auto & rbudget = gsmpl->rbudget;
++    auto & chain   = gsmpl->chain;
++    auto & cur_p   = gsmpl->cur_p;
++
++    gsmpl->cur.assign(candidates.data, candidates.data + candidates.size);
++    // The copied logits are about to be changed by penalties, biases and
++    // grammar filters, so any ordering from the source distribution is stale.
++    cur_p = { gsmpl->cur.data(), gsmpl->cur.size(), -1, false };
++
++    llama_sampler_apply(rbudget, &cur_p);
++
++    if (grammar_first && grammar_should_apply(gsmpl)) {
++        llama_sampler_apply(grmr, &cur_p);
++    }
++
++    bool has_candidate = false;
++    for (size_t i = 0; i < cur_p.size; ++i) {
++        has_candidate = has_candidate || std::isfinite(cur_p.data[i].logit);
++    }
++    if (!has_candidate) {
++        return LLAMA_TOKEN_NULL;
++    }
++
++    llama_sampler_apply(chain, &cur_p);
++
++    if (cur_p.selected < 0 || (size_t) cur_p.selected >= cur_p.size) {
++        return LLAMA_TOKEN_NULL;
++    }
++
++    const llama_token id = cur_p.data[cur_p.selected].id;
++
++    if (grammar_first || !grammar_should_apply(gsmpl)) {
++        return id;
++    }
++
++    llama_token_data       single = { id, 1.0f, 0.0f };
++    llama_token_data_array single_p = { &single, 1, -1, false };
++    llama_sampler_apply(grmr, &single_p);
++
++    if (std::isfinite(single.logit)) {
++        return id;
++    }
++
++    gsmpl->cur.assign(candidates.data, candidates.data + candidates.size);
++    cur_p = { gsmpl->cur.data(), gsmpl->cur.size(), -1, false };
++
++    llama_sampler_apply(rbudget, &cur_p);
++    if (grammar_should_apply(gsmpl)) {
++        llama_sampler_apply(grmr, &cur_p);
++    }
++
++    has_candidate = false;
++    for (size_t i = 0; i < cur_p.size; ++i) {
++        has_candidate = has_candidate || std::isfinite(cur_p.data[i].logit);
++    }
++    if (!has_candidate) {
++        return LLAMA_TOKEN_NULL;
++    }
++
++    llama_sampler_apply(chain, &cur_p);
++    if (cur_p.selected < 0 || (size_t) cur_p.selected >= cur_p.size) {
++        return LLAMA_TOKEN_NULL;
++    }
++
++    return cur_p.data[cur_p.selected].id;
++}
++
+ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, bool grammar_first) {
+     GGML_ASSERT(idxs.size() == draft.size() + 1 && "idxs.size() must be draft.size() + 1");
+ 
+diff --git a/common/sampling.h b/common/sampling.h
+index ced3c83..dfaa5a6 100644
+--- a/common/sampling.h
++++ b/common/sampling.h
+@@ -46,8 +46,9 @@ void common_sampler_free(struct common_sampler * gsmpl);
+ // if is_generated is true, the token is accepted by the sampling chain, the reasoning budget sampler, and the grammar sampler
+ void                    common_sampler_accept(struct common_sampler * gsmpl, llama_token token, bool is_generated);
+ void                    common_sampler_reset (struct common_sampler * gsmpl);
+-struct common_sampler * common_sampler_clone (struct common_sampler * gsmpl);
++struct common_sampler * common_sampler_clone (const struct common_sampler * gsmpl);
+ void                    common_sampler_copy  (const struct common_sampler * src, struct common_sampler * dst);
++void                    common_sampler_copy_state(const struct common_sampler * src, struct common_sampler * dst);
+ 
+ // arguments can be nullptr to skip printing
+ void common_perf_print(const struct llama_context * ctx, const struct common_sampler * gsmpl);
+@@ -67,6 +68,12 @@ struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl);
+ //
+ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first = false);
+ 
++// sample from a caller-provided sparse candidate set
++llama_token common_sampler_sample_from_candidates(
++        struct common_sampler * gsmpl,
++        const llama_token_data_array & candidates,
++        bool grammar_first = false);
++
+ // generalized version of common_sampler_sample
+ //
+ // will cross-reference the sampled tokens with a batch of draft tokens and accept those that match
+diff --git a/common/speculative.cpp b/common/speculative.cpp
+index cd2dfc7..e5bd14e 100644
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -14,8 +14,10 @@
+ 
+ #include <algorithm>
+ #include <cassert>
++#include <cstdlib>
+ #include <cstring>
+ #include <iomanip>
++#include <limits>
+ #include <map>
+ #include <cinttypes>
+ 
+@@ -161,6 +163,19 @@ struct common_speculative_impl {
+ 
+     virtual ~common_speculative_impl() = default;
+ 
++    virtual void reset(llama_seq_id /*seq_id*/) {}
++    virtual void invalidate(llama_seq_id seq_id) { reset(seq_id); }
++    virtual bool finalize(llama_seq_id /*seq_id*/) { return true; }
++    virtual bool supports_media() const {
++        // N-gram implementations only inspect the token history and do not own
++        // a draft KV cache, so media placeholders do not desynchronize them.
++        return type == COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE ||
++               type == COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K ||
++               type == COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V ||
++               type == COMMON_SPECULATIVE_TYPE_NGRAM_MOD ||
++               type == COMMON_SPECULATIVE_TYPE_NGRAM_CACHE;
++    }
++
+     virtual void begin(llama_seq_id seq_id, const llama_tokens & prompt) = 0;
+ 
+     virtual bool process(const llama_batch & batch) = 0;
+@@ -1277,6 +1292,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+     llama_batch batch;
+ 
+     std::vector<common_sampler_ptr> smpls;
++    std::vector<common_sampler_ptr> aligned_smpls;
+ 
+     // backend sampler chain per seq, attached to ctx_dft
+     std::vector<llama_sampler *> backend_chains;
+@@ -1294,7 +1310,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+     // Per-sequence cross-batch carryover: pair (h_p, x_{p+1}) at MTP pos p+1.
+     // The last h-row of one process() call needs the first token of the NEXT
+     // call to pair with, so it's stashed here until that next call fires.
+-    std::vector<std::vector<float>> pending_h;   // [n_seq][n_embd]
++    static constexpr llama_pos invalid_pos = std::numeric_limits<llama_pos>::min();
++
++    std::vector<std::vector<float>> pending_h;        // [n_seq][n_embd]
++    std::vector<llama_pos>          pending_pos;      // position represented by pending_h
++    std::vector<std::vector<float>> pending_prev_h;   // one boundary row retained for exact-cache replay
++    std::vector<llama_pos>          pending_prev_pos;
+ 
+     std::vector<int32_t> i_batch_beg;
+     std::vector<int32_t> i_batch_end;
+@@ -1303,10 +1324,33 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+     // Row 0 corresponds to the sampled token, row N to the Nth accepted draft token.
+     std::vector<std::vector<float>> verify_h;
+     std::vector<int32_t> verify_h_rows;
++    std::vector<std::vector<llama_pos>> verify_pos;
++
++    // Boundary that entered the latest verification batch. accept(0) needs it
++    // as the predecessor of verification row zero.
++    std::vector<std::vector<float>> verify_entry_h;
++    std::vector<llama_pos>          verify_entry_pos;
+ 
+     std::vector<int>                i_last;
+     std::vector<std::vector<float>> chain_h;
+ 
++    // Qwen-style single-head MTP normally re-evaluates the complete target
++    // verification batch in process(). On a fully accepted draft, defer that
++    // catch-up and prepend it to the next seed decode.
++    bool defer_verify_enabled = false;
++    bool align_target_sampler = false;
++    int32_t candidate_k       = 10;
++    llama_pos defer_verify_min_pos = 32768;
++    bool draft_pending        = false;
++    bool deferred_ready       = false;
++    bool fuse_catchup         = false;
++    std::vector<bool> healthy;
++    bool model_uses_mrope     = false;
++
++    std::vector<llama_token> deferred_tokens;
++    std::vector<llama_pos>   deferred_pos;
++    std::vector<float>       deferred_embd;
++
+     common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq)
+         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq)
+         , params(params.draft)
+@@ -1319,6 +1363,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+         GGML_ASSERT(n_embd == llama_model_n_embd_out(llama_get_model(ctx_tgt)) &&
+                 "MTP input row width must match the target h_nextn width");
+         n_mtp_layers = std::max(1, (int) llama_model_n_layer_nextn(llama_get_model(ctx_dft)));
++        const llama_rope_type rope_type = llama_model_rope_type(llama_get_model(ctx_tgt));
++        model_uses_mrope = rope_type == LLAMA_ROPE_TYPE_MROPE ||
++                           rope_type == LLAMA_ROPE_TYPE_IMROPE;
+ 
+         SPC_TRC("%s", "adding speculative implementation 'draft-mtp'\n");
+         SPC_TRC("- n_max=%d, n_min=%d, p_min=%.2f, n_embd=%d, backend_sampling=%d\n", this->params.n_max, this->params.n_min, this->params.p_min, n_embd, (int) this->params.backend_sampling);
+@@ -1336,11 +1383,20 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+         // TODO: fix, how to call without malloc
+         batch.token = (llama_token *) malloc(sizeof(llama_token) * n_b);
+ 
++        if (const char * candidate_k_env = std::getenv("LLAMA_MTP_CANDIDATE_K")) {
++            char * end = nullptr;
++            const long value = std::strtol(candidate_k_env, &end, 10);
++            if (end != candidate_k_env && value > 0) {
++                candidate_k = (int32_t) std::min<long>(value, 256);
++            }
++        }
++
+         smpls.resize(n_seq);
++        aligned_smpls.resize(n_seq);
+         for (auto & s : smpls) {
+             common_params_sampling sparams;
+             sparams.no_perf  = false;
+-            sparams.top_k    = 10;
++            sparams.top_k    = candidate_k;
+             sparams.samplers = { COMMON_SAMPLER_TYPE_TOP_K };
+             s.reset(common_sampler_init(llama_get_model(ctx_dft), sparams));
+         }
+@@ -1350,7 +1406,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+         if (this->params.backend_sampling) {
+             for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                 llama_sampler * chain = llama_sampler_chain_init(llama_sampler_chain_default_params());
+-                llama_sampler_chain_add(chain, llama_sampler_init_top_k(10));
++                llama_sampler_chain_add(chain, llama_sampler_init_top_k(candidate_k));
+ 
+                 if (!llama_set_sampler(ctx_dft, seq_id, chain)) {
+                     SPC_WRN("backend offload failed for seq_id=%d; using CPU sampler\n", (int) seq_id);
+@@ -1367,6 +1423,36 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+         is_mem_shared = llama_get_ctx_other(ctx_dft) == ctx_tgt;
+         chain_heads   = n_mtp_layers > 1 && !is_mem_shared;
+ 
++        const char * defer_env = std::getenv("LLAMA_MTP_DEFER_VERIFY");
++        defer_verify_enabled = defer_env &&
++            std::strcmp(defer_env, "0") != 0 &&
++            std::strcmp(defer_env, "false") != 0 &&
++            std::strcmp(defer_env, "off") != 0 &&
++            n_seq == 1 && !is_mem_shared && !chain_heads &&
++            n_b >= this->params.n_max + 2;
++        if (defer_verify_enabled) {
++            if (const char * min_pos_env = std::getenv("LLAMA_MTP_DEFER_VERIFY_MIN_POS")) {
++                char * end = nullptr;
++                const long long value = std::strtoll(min_pos_env, &end, 10);
++                if (end != min_pos_env && value >= 0) {
++                    defer_verify_min_pos = (llama_pos) value;
++                }
++            }
++            SPC_INF("%s", "enabled deferred MTP verification catch-up\n");
++        } else if (defer_env && std::strcmp(defer_env, "0") != 0 && n_b < this->params.n_max + 2) {
++            SPC_WRN("disabled deferred MTP verification: n_batch=%d requires at least %d\n",
++                    n_b, this->params.n_max + 2);
++        }
++
++        const char * align_env = std::getenv("LLAMA_MTP_ALIGN_TARGET_SAMPLER");
++        align_target_sampler = align_env &&
++            std::strcmp(align_env, "0") != 0 &&
++            std::strcmp(align_env, "false") != 0 &&
++            std::strcmp(align_env, "off") != 0;
++        if (align_target_sampler) {
++            SPC_INF("enabled target-aligned MTP proposals with candidate_k=%d\n", candidate_k);
++        }
++
+         if (chain_heads) {
+             this->params.n_max = std::min(this->params.n_max, n_mtp_layers);
+ 
+@@ -1377,6 +1463,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+         }
+ 
+         pending_h.assign(n_seq, std::vector<float>(n_embd, 0.0f));
++        pending_pos.assign(n_seq, -1);
++        pending_prev_h.assign(n_seq, std::vector<float>(n_embd, 0.0f));
++        pending_prev_pos.assign(n_seq, invalid_pos);
++        healthy.assign(n_seq, true);
+ 
+         i_last.assign(n_seq, -1);
+         i_batch_beg.assign(n_seq, -1);
+@@ -1384,6 +1474,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+ 
+         verify_h.assign(n_seq, {});
+         verify_h_rows.assign(n_seq, 0);
++        verify_pos.assign(n_seq, {});
++        verify_entry_h.assign(n_seq, std::vector<float>(n_embd, 0.0f));
++        verify_entry_pos.assign(n_seq, invalid_pos);
+     }
+ 
+     ~common_speculative_impl_draft_mtp() override {
+@@ -1406,7 +1499,220 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+         llama_batch_free(batch);
+     }
+ 
++    bool supports_media() const override {
++        // Qwen-style multimodal MTP needs the multi-axis positions preserved.
++        // Other projector/position layouts remain fail-closed.
++        return model_uses_mrope;
++    }
++
++    void discard_deferred() {
++        deferred_ready = false;
++        fuse_catchup   = false;
++        deferred_tokens.clear();
++        deferred_pos.clear();
++        deferred_embd.clear();
++    }
++
++    bool flush_deferred(llama_seq_id seq_id) {
++        if (deferred_tokens.empty()) {
++            discard_deferred();
++            return true;
++        }
++
++        const bool shape_ok =
++            deferred_tokens.size() == deferred_pos.size() &&
++            deferred_embd.size() == deferred_tokens.size() * (size_t) n_embd;
++        bool positions_ok = shape_ok;
++        for (size_t i = 1; positions_ok && i < deferred_pos.size(); ++i) {
++            positions_ok = deferred_pos[i - 1] + 1 == deferred_pos[i];
++        }
++        if (!positions_ok) {
++            SPC_ERR("invalid deferred MTP batch shape for seq_id=%d\n", (int) seq_id);
++            discard_deferred();
++            healthy[seq_id] = false;
++            return false;
++        }
++
++        auto * mem_dft = llama_get_memory(params.ctx_dft);
++        const llama_pos pos_first = deferred_pos.front();
++        llama_pos pos_max = llama_memory_seq_pos_max(mem_dft, seq_id);
++        if (pos_max >= pos_first) {
++            if (!llama_memory_seq_rm(mem_dft, seq_id, pos_first, -1)) {
++                SPC_ERR("failed to rewind deferred MTP memory for seq_id=%d at pos=%d\n",
++                        (int) seq_id, (int) pos_first);
++                healthy[seq_id] = false;
++                return false;
++            }
++            pos_max = llama_memory_seq_pos_max(mem_dft, seq_id);
++        }
++
++        if (pos_max + 1 != pos_first) {
++            SPC_ERR("deferred MTP boundary mismatch for seq_id=%d: pos_max=%d, first=%d\n",
++                    (int) seq_id, (int) pos_max, (int) pos_first);
++            healthy[seq_id] = false;
++            return false;
++        }
++
++        common_batch_clear(batch);
++        for (size_t i = 0; i < deferred_tokens.size(); ++i) {
++            common_batch_add(batch, deferred_tokens[i], deferred_pos[i], { seq_id }, false);
++            std::memcpy(batch.embd + i * n_embd,
++                        deferred_embd.data() + i * n_embd,
++                        (size_t) n_embd * sizeof(float));
++        }
++
++        const int32_t rc = llama_decode(params.ctx_dft, batch);
++        if (rc != 0) {
++            SPC_ERR("deferred llama_decode returned %d\n", rc);
++            healthy[seq_id] = false;
++            return false;
++        }
++
++        discard_deferred();
++        return true;
++    }
++
++    bool finalize(llama_seq_id seq_id) override {
++        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
++            return false;
++        }
++
++        return healthy[seq_id] &&
++            (!(deferred_ready || fuse_catchup) || flush_deferred(seq_id));
++    }
++
++    void clear_transient(llama_seq_id seq_id) {
++        verify_h_rows[seq_id] = 0;
++        verify_h[seq_id].clear();
++        verify_pos[seq_id].clear();
++        verify_entry_pos[seq_id] = invalid_pos;
++        i_last[seq_id] = -1;
++        aligned_smpls[seq_id].reset();
++    }
++
++    void reset(llama_seq_id seq_id) override {
++        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
++            return;
++        }
++
++        discard_deferred();
++
++        deferred_ready = false;
++        fuse_catchup   = false;
++        draft_pending  = false;
++        healthy[seq_id] = true;
++
++        // Keep the current and previous boundary rows across request resets.
++        // The server may retain the corresponding KV state and replay its last
++        // token solely to regenerate logits ([TAG_PROMPT_LOGITS]).
++        clear_transient(seq_id);
++    }
++
++    void invalidate(llama_seq_id seq_id) override {
++        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
++            return;
++        }
++
++        discard_deferred();
++        draft_pending = false;
++        clear_transient(seq_id);
++        healthy[seq_id] = false;
++        pending_pos[seq_id] = invalid_pos;
++        pending_prev_pos[seq_id] = invalid_pos;
++    }
++
++    bool get_state(llama_seq_id seq_id, std::vector<uint8_t> & data) const override {
++        data.clear();
++        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq || !healthy[seq_id] ||
++                pending_pos[seq_id] == invalid_pos) {
++            return false;
++        }
++
++        static constexpr uint32_t magic = 0x3150544d; // MTP1
++        static constexpr uint32_t version = 2;
++        const uint32_t width = (uint32_t) n_embd;
++        const size_t header_size = 3 * sizeof(uint32_t);
++        const size_t pos_size = 2 * sizeof(llama_pos);
++        const size_t row_size = (size_t) n_embd * sizeof(float);
++
++        data.resize(header_size + pos_size + 2 * row_size);
++        std::memcpy(data.data() + 0 * sizeof(uint32_t), &magic,   sizeof(uint32_t));
++        std::memcpy(data.data() + 1 * sizeof(uint32_t), &version, sizeof(uint32_t));
++        std::memcpy(data.data() + 2 * sizeof(uint32_t), &width,   sizeof(uint32_t));
++        std::memcpy(data.data() + header_size, &pending_pos[seq_id], sizeof(llama_pos));
++        std::memcpy(data.data() + header_size + sizeof(llama_pos), &pending_prev_pos[seq_id], sizeof(llama_pos));
++        std::memcpy(data.data() + header_size + pos_size, pending_h[seq_id].data(), row_size);
++        std::memcpy(data.data() + header_size + pos_size + row_size, pending_prev_h[seq_id].data(), row_size);
++        return true;
++    }
++
++    void set_state(llama_seq_id seq_id, const std::vector<uint8_t> & data) override {
++        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
++            return;
++        }
++
++        static constexpr uint32_t expected_magic = 0x3150544d; // MTP1
++        static constexpr uint32_t expected_version = 2;
++        const size_t header_size = 3 * sizeof(uint32_t);
++        const size_t pos_size = 2 * sizeof(llama_pos);
++        const size_t row_size = (size_t) n_embd * sizeof(float);
++        if (data.size() != header_size + pos_size + 2 * row_size) {
++            invalidate(seq_id);
++            return;
++        }
++
++        uint32_t magic = 0;
++        uint32_t version = 0;
++        uint32_t width = 0;
++        std::memcpy(&magic,   data.data() + 0 * sizeof(uint32_t), sizeof(uint32_t));
++        std::memcpy(&version, data.data() + 1 * sizeof(uint32_t), sizeof(uint32_t));
++        std::memcpy(&width,   data.data() + 2 * sizeof(uint32_t), sizeof(uint32_t));
++        if (magic != expected_magic || version != expected_version || width != (uint32_t) n_embd) {
++            invalidate(seq_id);
++            return;
++        }
++
++        llama_pos next_pos = invalid_pos;
++        llama_pos next_prev_pos = invalid_pos;
++        std::vector<float> next_h(n_embd);
++        std::vector<float> next_prev_h(n_embd);
++
++        std::memcpy(&next_pos, data.data() + header_size, sizeof(llama_pos));
++        std::memcpy(&next_prev_pos, data.data() + header_size + sizeof(llama_pos), sizeof(llama_pos));
++        std::memcpy(next_h.data(), data.data() + header_size + pos_size, row_size);
++        std::memcpy(next_prev_h.data(), data.data() + header_size + pos_size + row_size, row_size);
++
++        const bool pos_ok = next_pos >= -1 &&
++            (next_prev_pos == invalid_pos ||
++             (next_prev_pos >= -1 && (model_uses_mrope
++                ? next_prev_pos <= next_pos
++                : next_prev_pos + 1 == next_pos)));
++        const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(params.ctx_dft), seq_id);
++        if (!pos_ok || pos_max != next_pos) {
++            SPC_WRN("refusing inconsistent MTP state for seq_id=%d: state_pos=%d, prev_pos=%d, kv_pos=%d\n",
++                    (int) seq_id, (int) next_pos, (int) next_prev_pos, (int) pos_max);
++            invalidate(seq_id);
++            return;
++        }
++
++        // Commit only after the complete blob and the restored draft KV boundary
++        // have been validated. A malformed blob cannot partially overwrite the
++        // live host-side hidden state.
++        discard_deferred();
++        draft_pending = false;
++        clear_transient(seq_id);
++        pending_h[seq_id] = std::move(next_h);
++        pending_pos[seq_id] = next_pos;
++        pending_prev_h[seq_id] = std::move(next_prev_h);
++        pending_prev_pos[seq_id] = next_prev_pos;
++        healthy[seq_id] = true;
++    }
++
+     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
++        if (defer_verify_enabled && (draft_pending || deferred_ready || fuse_catchup)) {
++            reset(seq_id);
++        }
++
+         const int32_t N = (int32_t) prompt.size();
+         if (N <= 0) {
+             return;
+@@ -1429,27 +1735,38 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+             return true;
+         }
+ 
+-        // TODO: how to make it work with vision tokens?
+-        if (batch_in.token == nullptr || batch_in.embd != nullptr) {
++        const bool is_text_batch  = batch_in.token != nullptr;
++        const bool is_media_batch = batch_in.token == nullptr && batch_in.embd != nullptr;
++        if (!is_text_batch && !is_media_batch) {
++            return true;
++        }
++
++        if (is_media_batch && !supports_media()) {
++            for (int32_t k = 0; k < batch_in.n_tokens; ++k) {
++                if (batch_in.n_seq_id[k] == 1) {
++                    invalidate(batch_in.seq_id[k][0]);
++                }
++            }
+             return true;
+         }
+ 
+         const int32_t n_tokens = batch_in.n_tokens;
+ 
++        if (fuse_catchup && (!healthy[0] || !flush_deferred(0))) {
++            return true;
++        }
++
+         // remember the frist and last batch index for each sequence
+         std::fill(i_batch_beg.begin(), i_batch_beg.end(), -1);
+         std::fill(i_batch_end.begin(), i_batch_end.end(), -1);
+ 
+         for (int k = 0; k < n_tokens; ++k) {
+-            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+-                GGML_ASSERT(batch_in.n_seq_id[k] == 1);
+-
+-                if (batch_in.seq_id[k][0] == seq_id) {
+-                    i_batch_end[seq_id] = k;
+-                    if (i_batch_beg[seq_id] < 0) {
+-                        i_batch_beg[seq_id] = k;
+-                    }
+-                }
++            GGML_ASSERT(batch_in.n_seq_id[k] == 1);
++            const llama_seq_id seq_id = batch_in.seq_id[k][0];
++            GGML_ASSERT(seq_id >= 0 && seq_id < (llama_seq_id) n_seq);
++            i_batch_end[seq_id] = k;
++            if (i_batch_beg[seq_id] < 0) {
++                i_batch_beg[seq_id] = k;
+             }
+         }
+ 
+@@ -1458,45 +1775,161 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+ 
+         const size_t row_bytes = (size_t) n_embd * sizeof(float);
+ 
+-        // if kv is shared with target (e.g Gemma4), then we can skip this catch-up decode
+-        if (!is_mem_shared) {
+-            common_batch_clear(batch);
+-
+-            for (int k = 0; k < n_tokens; ++k) {
+-                common_batch_add(batch, batch_in.token[k], batch_in.pos[k], { batch_in.seq_id[k][0] }, 0);
++        std::vector<bool> active(n_seq, false);
++        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
++            const int32_t beg = i_batch_beg[seq_id];
++            const int32_t end = i_batch_end[seq_id];
++            if (beg < 0 || !healthy[seq_id]) {
++                continue;
+             }
+ 
+-            // shift the tgt embeddings to the right by one position
+-            // assumes that the tokens in the batch are sequential for each sequence
+-            // i.e. we cannot have seq_id like this: [0, 0, 0, 1, 1, 0, 1, 1]
+-            //                                                       ^--- this is a problem
+-            // TODO:this is generally true, but would be nice to assert it
+-            {
+-                const float * h_tgt = llama_get_embeddings_nextn(ctx_tgt);
+-                std::memcpy(batch.embd + (size_t) 1 * n_embd, h_tgt, row_bytes * (n_tokens-1));
++            // The MTP input shift is defined per sequence. Text rows must be
++            // consecutive. M-RoPE media rows can share their temporal position,
++            // but may not move backwards.
++            bool shape_ok = true;
++            for (int32_t k = beg; k <= end; ++k) {
++                shape_ok = shape_ok &&
++                    batch_in.n_seq_id[k] == 1 &&
++                    batch_in.seq_id[k][0] == seq_id;
++                if (k > beg) {
++                    shape_ok = shape_ok && (is_media_batch
++                        ? batch_in.pos[k] >= batch_in.pos[k - 1]
++                        : batch_in.pos[k] == batch_in.pos[k - 1] + 1);
++                }
++            }
++            if (!shape_ok) {
++                SPC_WRN("invalid MTP %s batch layout for seq_id=%d\n",
++                        is_media_batch ? "media" : "text", (int) seq_id);
++                invalidate(seq_id);
++                continue;
+             }
+ 
+-            // fill the pending embeddings from a previous run
+-            auto set_h = [&](int idx, const float * h_row) {
+-                std::memcpy(batch.embd + (size_t) idx * n_embd, h_row, row_bytes);
+-            };
++            const llama_pos first_pos = batch_in.pos[beg];
++            const llama_pos kv_pos = llama_memory_seq_pos_max(llama_get_memory(ctx_dft), seq_id);
+ 
+-            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+-                if (i_batch_beg[seq_id] < 0) {
++            // A new context starts at position zero. This also covers a cached
++            // one-token prompt replay: its predecessor is the all-zero boundary
++            // at position -1.
++            if (first_pos == 0 && pending_pos[seq_id] != -1) {
++                std::fill(pending_h[seq_id].begin(), pending_h[seq_id].end(), 0.0f);
++                pending_pos[seq_id] = -1;
++                pending_prev_pos[seq_id] = invalid_pos;
++            }
++
++            if (is_text_batch && first_pos == pending_pos[seq_id]) {
++                // Exact prompt-cache hit: [TAG_PROMPT_LOGITS] removes and
++                // re-evaluates the cached last token. Roll the host boundary
++                // back one row before constructing its MTP pair.
++                if (pending_prev_pos[seq_id] + 1 != pending_pos[seq_id]) {
++                    SPC_WRN("missing previous MTP boundary for exact replay, seq_id=%d, pos=%d\n",
++                            (int) seq_id, (int) first_pos);
++                    invalidate(seq_id);
+                     continue;
+                 }
++                pending_h[seq_id] = pending_prev_h[seq_id];
++                pending_pos[seq_id] = pending_prev_pos[seq_id];
++                pending_prev_pos[seq_id] = invalid_pos;
++            }
++
++            const bool host_boundary_ok = model_uses_mrope
++                ? (is_media_batch ? pending_pos[seq_id] <= first_pos
++                                  : pending_pos[seq_id] <  first_pos)
++                : pending_pos[seq_id] + 1 == first_pos;
++            if (!host_boundary_ok) {
++                SPC_WRN("MTP host boundary mismatch for seq_id=%d: pending=%d, first=%d\n",
++                        (int) seq_id, (int) pending_pos[seq_id], (int) first_pos);
++                invalidate(seq_id);
++                continue;
++            }
+ 
+-                set_h(i_batch_beg[seq_id], pending_h[seq_id].data());
++            // With a separate draft context, its KV endpoint must describe the
++            // same predecessor as the host hidden row. Shared-memory models have
++            // already decoded the target batch by the time this hook runs.
++            if (!is_mem_shared && kv_pos != pending_pos[seq_id]) {
++                SPC_WRN("MTP KV/host boundary mismatch for seq_id=%d: kv=%d, host=%d, first=%d\n",
++                        (int) seq_id, (int) kv_pos, (int) pending_pos[seq_id], (int) first_pos);
++                invalidate(seq_id);
++                continue;
++            }
++
++            clear_transient(seq_id);
++            std::memcpy(verify_entry_h[seq_id].data(), pending_h[seq_id].data(), row_bytes);
++            verify_entry_pos[seq_id] = pending_pos[seq_id];
++            active[seq_id] = true;
++        }
++
++        const bool defer_this_verify =
++            !is_media_batch && defer_verify_enabled && healthy[0] && active[0] && draft_pending &&
++            n_tokens >= 2 && n_tokens <= this->params.n_max + 1 &&
++            i_batch_beg[0] == 0 && i_batch_end[0] == n_tokens - 1 &&
++            batch_in.pos[n_tokens - 1] >= defer_verify_min_pos;
++        draft_pending = false;
++
++        if (std::none_of(active.begin(), active.end(), [](bool value) { return value; })) {
++            return true;
++        }
++
++        // if kv is shared with target (e.g Gemma4), then we can skip this catch-up decode
++        if (!is_mem_shared) {
++            llama_batch media_batch = {};
++            std::vector<float> media_h;
++            llama_batch * decode_batch = &batch;
++
++            if (is_text_batch) {
++                common_batch_clear(batch);
++
++                for (int k = 0; k < n_tokens; ++k) {
++                    const llama_seq_id seq_id = batch_in.seq_id[k][0];
++                    if (!active[seq_id]) {
++                        continue;
++                    }
++
++                    common_batch_add(batch, batch_in.token[k], batch_in.pos[k], { seq_id }, false);
++                    const float * h_row = k == i_batch_beg[seq_id]
++                        ? pending_h[seq_id].data()
++                        : llama_get_embeddings_nextn_ith(ctx_tgt, k - 1);
++                    std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, h_row, row_bytes);
++                }
++            } else {
++                // Keep the original visual/audio embedding and every M-RoPE axis,
++                // while supplying the shifted target hidden row independently.
++                // A mixed healthy/unhealthy media batch cannot be filtered without
++                // changing its grid layout, so fail it closed as one unit.
++                for (int k = 0; k < n_tokens; ++k) {
++                    if (!active[batch_in.seq_id[k][0]]) {
++                        return true;
++                    }
++                }
++
++                media_h.resize((size_t) n_tokens * n_embd);
++                for (int k = 0; k < n_tokens; ++k) {
++                    const llama_seq_id seq_id = batch_in.seq_id[k][0];
++                    const float * h_row = k == i_batch_beg[seq_id]
++                        ? pending_h[seq_id].data()
++                        : llama_get_embeddings_nextn_ith(ctx_tgt, k - 1);
++                    std::memcpy(media_h.data() + (size_t) k * n_embd, h_row, row_bytes);
++                }
++
++                media_batch = batch_in;
++                media_batch.embd_h = media_h.data();
++                decode_batch = &media_batch;
++            }
++
++            if (defer_this_verify) {
++                deferred_tokens.assign(batch.token, batch.token + batch.n_tokens);
++                deferred_pos.assign(batch.pos, batch.pos + batch.n_tokens);
++                deferred_embd.assign(batch.embd, batch.embd + (size_t) batch.n_tokens * n_embd);
++                deferred_ready = true;
+             }
+ 
+             auto * mem_dft = llama_get_memory(ctx_dft);
+ 
+             bool ok = true;
+-            for (int head = 0; head < n_mtp_layers; ++head) {
++            for (int head = 0; !defer_this_verify && head < n_mtp_layers; ++head) {
+                 if (chain_heads) {
+                     // ref: https://github.com/ggml-org/llama.cpp/pull/24340/changes#r3413498544
+                     for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+-                        if (i_batch_beg[seq_id] < 0) {
++                        if (!active[seq_id]) {
+                             continue;
+                         }
+                         llama_memory_seq_rm(mem_dft, seq_id, batch_in.pos[i_batch_beg[seq_id]], -1);
+@@ -1504,7 +1937,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+                     llama_set_nextn_layer_offset(ctx_dft, head);
+                 }
+ 
+-                const int32_t rc = llama_decode(ctx_dft, batch);
++                const int32_t rc = llama_decode(ctx_dft, *decode_batch);
+                 if (rc != 0) {
+                     SPC_ERR("llama_decode(ctx_dft) head=%d failed rc=%d (pos=%d)\n",
+                             head, (int) rc, (int) batch_in.pos[0]);
+@@ -1517,26 +1950,44 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+                 llama_set_nextn_layer_offset(ctx_dft, 0); // restore default for non-draft decodes
+             }
+             if (!ok) {
+-                return false;
++                // The target decode already succeeded. Fail speculative decoding
++                // closed for these sequences, but do not take down generation.
++                for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
++                    if (active[seq_id]) {
++                        invalidate(seq_id);
++                    }
++                }
++                return true;
+             }
+         }
+ 
+         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+-            if (i_batch_end[seq_id] < 0) {
++            if (!active[seq_id]) {
+                 continue;
+             }
+ 
+             const int32_t n_rows = i_batch_end[seq_id] - i_batch_beg[seq_id] + 1;
+             verify_h_rows[seq_id] = n_rows;
+             verify_h[seq_id].resize((size_t) n_rows * n_embd);
++            verify_pos[seq_id].resize(n_rows);
+ 
+             for (int32_t i = 0; i < n_rows; ++i) {
+                 const float * h = llama_get_embeddings_nextn_ith(ctx_tgt, i_batch_beg[seq_id] + i);
+                 std::memcpy(verify_h[seq_id].data() + (size_t) i * n_embd, h, row_bytes);
++                verify_pos[seq_id][i] = batch_in.pos[i_batch_beg[seq_id] + i];
+             }
+ 
++            if (n_rows == 1) {
++                std::memcpy(pending_prev_h[seq_id].data(), verify_entry_h[seq_id].data(), row_bytes);
++                pending_prev_pos[seq_id] = verify_entry_pos[seq_id];
++            } else {
++                std::memcpy(pending_prev_h[seq_id].data(),
++                        verify_h[seq_id].data() + (size_t) (n_rows - 2) * n_embd, row_bytes);
++                pending_prev_pos[seq_id] = verify_pos[seq_id][n_rows - 2];
++            }
+             std::memcpy(pending_h[seq_id].data(),
+                     verify_h[seq_id].data() + (size_t) (n_rows - 1) * n_embd, row_bytes);
++            pending_pos[seq_id] = verify_pos[seq_id][n_rows - 1];
+         }
+ 
+         return true;
+@@ -1552,18 +2003,53 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+         std::vector<bool> drafting(n_seq);
+ 
+         const size_t row_bytes = (size_t) n_embd * sizeof(float);
++        bool fused_deferred = false;
+ 
+         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+             auto & dp = dparams[seq_id];
+ 
+-            if (!dp.drafting) {
++            if (!dp.drafting || !healthy[seq_id]) {
++                if (!healthy[seq_id]) {
++                    dp.drafting = false;
++                    if (dp.result) {
++                        dp.result->clear();
++                    }
++                }
+                 continue;
+             }
+ 
++            if (fuse_catchup) {
++                const bool consecutive = !deferred_pos.empty() && deferred_pos.back() + 1 == dp.n_past;
++                const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_dft), seq_id);
++                const bool boundary_ok = !deferred_pos.empty() && pos_max + 1 == deferred_pos.front();
++
++                if (consecutive && boundary_ok) {
++                    for (size_t i = 0; i < deferred_tokens.size(); ++i) {
++                        common_batch_add(batch, deferred_tokens[i], deferred_pos[i], { seq_id }, false);
++                        std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd,
++                                    deferred_embd.data() + i * n_embd, row_bytes);
++                    }
++                    fused_deferred = true;
++                } else if (!flush_deferred(seq_id)) {
++                    dp.drafting = false;
++                    continue;
++                }
++            }
++
+             n_drafting++;
+             drafting[seq_id] = true;
+             common_sampler_reset(smpls[seq_id].get());
+ 
++            if (align_target_sampler && dp.sampler) {
++                if (!aligned_smpls[seq_id]) {
++                    aligned_smpls[seq_id].reset(common_sampler_clone(dp.sampler));
++                } else {
++                    common_sampler_copy_state(dp.sampler, aligned_smpls[seq_id].get());
++                }
++            } else {
++                aligned_smpls[seq_id].reset();
++            }
++
+             common_batch_add(batch, dp.id_last, dp.n_past, { seq_id }, true);
+             std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, pending_h[seq_id].data(), row_bytes);
+ 
+@@ -1596,9 +2082,23 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+             int ret = llama_decode(ctx_dft, batch);
+             if (ret != 0) {
+                 SPC_ERR("llama_decode[%d] returned %d\n", i, ret);
++                for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
++                    if (drafting[seq_id]) {
++                        drafting[seq_id] = false;
++                        dparams[seq_id].drafting = false;
++                        dparams[seq_id].result->clear();
++                        invalidate(seq_id);
++                    }
++                }
++                n_drafting = 0;
+                 break;
+             }
+ 
++            if (fused_deferred) {
++                discard_deferred();
++                fused_deferred = false;
++            }
++
+             // rebuild the batch for the next step: the growing-KV paths re-add only the
+             // new token (the KV already holds the prefix), while chained heads re-add the
+             // whole prefix at the next head. dropped sequences are simply not re-added.
+@@ -1614,7 +2114,20 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+                 common_sampler_sample(smpl, ctx_dft, i_last[seq_id], true);
+                 const float * h_row = llama_get_embeddings_nextn_ith(ctx_dft, i_last[seq_id]);
+ 
+-                const auto * cur_p = common_sampler_get_candidates(smpl, true);
++                const auto * mtp_p = common_sampler_get_candidates(smpl, true);
++
++                llama_token id = mtp_p->data[0].id;
++                auto * proposal_smpl = aligned_smpls[seq_id].get();
++                if (proposal_smpl) {
++                    id = common_sampler_sample_from_candidates(proposal_smpl, *mtp_p, false);
++                    if (id == LLAMA_TOKEN_NULL) {
++                        drafting[seq_id] = false;
++                        n_drafting--;
++                        continue;
++                    }
++                }
++
++                const auto * cur_p = proposal_smpl ? common_sampler_get_candidates(proposal_smpl, true) : mtp_p;
+ 
+                 for (int k = 0; k < std::min(3, (int) cur_p->size); ++k) {
+                     SPC_DBG(" - seq_id %d, draft candidate %3d, pos %3d: %6d (%8.3f) '%s'\n",
+@@ -1622,11 +2135,16 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+                             common_token_to_piece(ctx_dft, cur_p->data[k].id).c_str());
+                 }
+ 
+-                // add drafted token for each sequence
+-                const llama_token id = cur_p->data[0].id;
++                float p_mtp_selected = 0.0f;
++                for (size_t k = 0; k < mtp_p->size; ++k) {
++                    if (mtp_p->data[k].id == id) {
++                        p_mtp_selected = mtp_p->data[k].p;
++                        break;
++                    }
++                }
+ 
+                 // only collect very high-confidence draft tokens
+-                if (cur_p->data[0].p < params.p_min) {
++                if (p_mtp_selected < params.p_min) {
+                     drafting[seq_id] = false;
+                     n_drafting--;
+ 
+@@ -1634,6 +2152,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+                 }
+ 
+                 common_sampler_accept(smpl, id, true);
++                common_sampler_accept(proposal_smpl, id, true);
+ 
+                 auto & dp = dparams.at(seq_id);
+                 auto & result = *dp.result;
+@@ -1683,29 +2202,56 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+ 
+         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+             auto & dp = dparams[seq_id];
+-            if (!dp.drafting) {
+-                continue;
+-            }
+-
+-            if (dp.result->size() < (size_t) params.n_min) {
++            if (dp.drafting && dp.result->size() < (size_t) params.n_min) {
+                 dp.result->clear();
+             }
++
++            draft_pending = draft_pending || !dp.result->empty();
+         }
+     }
+ 
+     void accept(llama_seq_id seq_id, uint16_t n_accepted, bool /*is_other*/) override {
+-        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
++        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq || !healthy[seq_id]) {
+             return;
+         }
+ 
++        if (deferred_ready) {
++            const bool fully_accepted = (size_t) n_accepted + 1 == deferred_tokens.size();
++
++            if (fully_accepted) {
++                deferred_ready = false;
++                fuse_catchup = true;
++            } else {
++                if (!flush_deferred(seq_id)) {
++                    return;
++                }
++            }
++        }
++
+         const int32_t n_rows = verify_h_rows[seq_id];
+-        if (n_rows <= 0) {
++        if (n_rows <= 0 || verify_pos[seq_id].size() != (size_t) n_rows) {
+             return;
+         }
+ 
+         const int32_t i_h = std::min<int32_t>(n_accepted, n_rows - 1);
+         const size_t row_bytes = (size_t) n_embd * sizeof(float);
++
++        // Rewind both sides of the retained boundary. For row zero, the
++        // predecessor is the current row that entered verification; otherwise
++        // it is the previous verification row. This is required for a later
++        // exact-cache single-token replay.
++        if (i_h == 0) {
++            std::memcpy(pending_prev_h[seq_id].data(), verify_entry_h[seq_id].data(), row_bytes);
++            pending_prev_pos[seq_id] = verify_entry_pos[seq_id];
++        } else {
++            std::memcpy(pending_prev_h[seq_id].data(),
++                    verify_h[seq_id].data() + (size_t) (i_h - 1) * n_embd, row_bytes);
++            pending_prev_pos[seq_id] = verify_pos[seq_id][i_h - 1];
++        }
+         std::memcpy(pending_h[seq_id].data(), verify_h[seq_id].data() + (size_t) i_h * n_embd, row_bytes);
++        pending_pos[seq_id] = verify_pos[seq_id][i_h];
++
++        clear_transient(seq_id);
+     }
+ };
+ 
+@@ -2581,6 +3127,61 @@ common_speculative_draft_params & common_speculative_get_draft_params(
+     return spec->dparams[seq_id];
+ }
+ 
++void common_speculative_reset(common_speculative * spec, llama_seq_id seq_id) {
++    if (spec == nullptr) {
++        return;
++    }
++
++    GGML_ASSERT(seq_id >= 0 && seq_id < (llama_seq_id) spec->dparams.size());
++
++    spec->dparams[seq_id] = {};
++    spec->impl_last[seq_id] = nullptr;
++
++    for (auto & impl : spec->impls) {
++        impl->reset(seq_id);
++    }
++}
++
++void common_speculative_invalidate(common_speculative * spec, llama_seq_id seq_id) {
++    if (spec == nullptr) {
++        return;
++    }
++
++    GGML_ASSERT(seq_id >= 0 && seq_id < (llama_seq_id) spec->dparams.size());
++
++    spec->dparams[seq_id] = {};
++    spec->impl_last[seq_id] = nullptr;
++
++    for (auto & impl : spec->impls) {
++        impl->invalidate(seq_id);
++    }
++}
++
++bool common_speculative_finalize(common_speculative * spec, llama_seq_id seq_id) {
++    if (spec == nullptr) {
++        return true;
++    }
++
++    GGML_ASSERT(seq_id >= 0 && seq_id < (llama_seq_id) spec->dparams.size());
++
++    bool result = true;
++    for (auto & impl : spec->impls) {
++        result = impl->finalize(seq_id) && result;
++    }
++    return result;
++}
++
++bool common_speculative_supports_media(const common_speculative * spec) {
++    if (spec == nullptr || spec->impls.empty()) {
++        return false;
++    }
++
++    return std::all_of(spec->impls.begin(), spec->impls.end(),
++            [](const std::unique_ptr<common_speculative_impl> & impl) {
++                return impl->supports_media();
++            });
++}
++
+ void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, const llama_tokens & prompt) {
+     if (spec == nullptr) {
+         return;
+@@ -2726,6 +3327,7 @@ void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, u
+ 
+ // TODO: support the case of more than one speculative implementations having a state
+ bool common_speculative_get_state(common_speculative * spec, llama_seq_id seq_id, std::vector<uint8_t> & data) {
++    data.clear();
+     if (spec == nullptr) {
+         return false;
+     }
+@@ -2736,6 +3338,7 @@ bool common_speculative_get_state(common_speculative * spec, llama_seq_id seq_id
+         }
+     }
+ 
++    data.clear();
+     return false;
+ }
+ 
+diff --git a/common/speculative.h b/common/speculative.h
+index 12ae31b..a3b5a9b 100644
+--- a/common/speculative.h
++++ b/common/speculative.h
+@@ -4,6 +4,7 @@
+ #include "common.h"
+ 
+ struct common_speculative;
++struct common_sampler;
+ 
+ // comma separated list the provided types
+ std::string common_speculative_type_name_str(const std::vector<enum common_speculative_type> & types);
+@@ -60,10 +61,27 @@ struct common_speculative_draft_params {
+ 
+     // the generated draft from the last _draft() call
+     llama_tokens * result;
++
++    // target sampler state for proposal alignment
++    const common_sampler * sampler = nullptr;
+ };
+ 
+ common_speculative_draft_params & common_speculative_get_draft_params(common_speculative * spec, llama_seq_id seq_id);
+ 
++// reset per-sequence state at a request boundary
++void common_speculative_reset(common_speculative * spec, llama_seq_id seq_id);
++
++// fail closed for a sequence whose draft-side state can no longer be aligned
++// with the target context (for example, after an unsupported context mutation)
++void common_speculative_invalidate(common_speculative * spec, llama_seq_id seq_id);
++
++// commit any deferred draft-side state before the memory layout changes
++bool common_speculative_finalize(common_speculative * spec, llama_seq_id seq_id);
++
++// True when every configured implementation can keep its state synchronized
++// across multimodal embedding batches.
++bool common_speculative_supports_media(const common_speculative * spec);
++
+ // optionally call once at the beginning of a new generation
+ void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, const llama_tokens & prompt);
+ 
+diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
+index 7654ea1..157faae 100644
+--- a/ggml/src/ggml-backend-meta.cpp
++++ b/ggml/src/ggml-backend-meta.cpp
+@@ -6,6 +6,7 @@
+ #include "ggml-cpp.h"
+ 
+ #include <algorithm>
++#include <atomic>
+ #include <cassert>
+ #include <cmath>
+ #include <cstddef>
+@@ -16,6 +17,7 @@
+ #include <set>
+ #include <string>
+ #include <tuple>
++#include <thread>
+ #include <utility>
+ #include <vector>
+ 
+@@ -723,6 +725,13 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
+         if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_0 && src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+             return src_ss[0];
+         }
++        // A TOP_K performed locally on an axis-0 vocabulary shard produces
++        // shard-local row indices.  Keep GET_ROWS local as well; its compact
++        // result is concatenated by the Meta async get path and merged on the
++        // host.  Both inputs have matching device ratios in this case.
++        if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_1 && src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_0) {
++            return {GGML_BACKEND_SPLIT_AXIS_1, {0}, {1}, 1};
++        }
+         return handle_generic(src_ss, /*scalar_only =*/ true);
+     };
+ 
+@@ -747,6 +756,13 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
+     };
+ 
+     auto handle_flash_attn_ext = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
++        if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED &&
++            src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED &&
++            src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
++            GGML_ASSERT(tensor->src[3] == nullptr || src_ss[3].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
++            GGML_ASSERT(tensor->src[4] == nullptr || src_ss[4].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
++            return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
++        }
+         GGML_ASSERT(                             src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_2);
+         GGML_ASSERT(                             src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_2);
+         GGML_ASSERT(                             src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_2);
+@@ -813,6 +829,16 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
+                 continue;
+             }
+             src_ss[i] = ggml_backend_meta_get_split_state(stc, tensor->src[i], /*assume_sync =*/ true);
++            // build_sampling() pads an empty [vocab, 0] logits tensor to one
++            // dummy row while reserving an inactive sampler graph.  Empty
++            // tensors intentionally have UNKNOWN split state; PAD can still
++            // be represented safely as MIRRORED because this dummy output is
++            // never selected.  Defer the normal source-state assertion to all
++            // other operations.
++            if (src_ss[i].axis == GGML_BACKEND_SPLIT_AXIS_UNKNOWN &&
++                    tensor->op == GGML_OP_PAD && ggml_nelements(tensor->src[i]) == 0) {
++                src_ss[i] = {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
++            }
+             GGML_ASSERT(src_ss[i].axis != GGML_BACKEND_SPLIT_AXIS_UNKNOWN);
+         }
+ 
+@@ -950,10 +976,17 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
+             case GGML_OP_TIMESTEP_EMBEDDING: {
+                 split_state = handle_generic(src_ss, /*scalar_only =*/ true);
+             } break;
+-            case GGML_OP_ARGSORT:
+-            case GGML_OP_TOP_K: {
++            case GGML_OP_ARGSORT: {
+                 split_state = handle_per_row(src_ss);
+             } break;
++            case GGML_OP_TOP_K: {
++                // For TP vocabulary logits, execute a local top-k on each
++                // axis-0 shard.  The caller sizes the logical result so each
++                // simple backend receives the requested local k.
++                split_state = src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_0
++                    ? src_ss[0]
++                    : handle_per_row(src_ss);
++            } break;
+             case GGML_OP_LEAKY_RELU: {
+                 split_state = handle_generic(src_ss, /*scalar_only =*/ false);
+             } break;
+@@ -1623,6 +1656,55 @@ struct ggml_backend_meta_context {
+     void *                               comm_ctx       = nullptr;
+     ggml_backend_comm_allreduce_tensor_t comm_allreduce = nullptr;
+ 
++    struct launch_job {
++        ggml_backend_t backend = nullptr;
++        ggml_cgraph *  graph   = nullptr;
++    };
++
++    bool                  parallel_launch = false;
++    launch_job            launch_jobs[2];
++    std::thread           launch_workers[2];
++    std::atomic<uint64_t> launch_generation{0};
++    std::atomic<uint64_t> launch_done[2]{{0}, {0}};
++    std::atomic<int>      launch_status[2]{{GGML_STATUS_SUCCESS}, {GGML_STATUS_SUCCESS}};
++    std::atomic<bool>     launch_stop{false};
++
++    void launch_worker_loop(size_t rank) {
++        uint64_t seen = 0;
++        while (true) {
++            const uint64_t generation = launch_generation.load(std::memory_order_acquire);
++            if (generation == seen) {
++                std::this_thread::yield();
++                continue;
++            }
++            if (launch_stop.load(std::memory_order_acquire)) {
++                return;
++            }
++            seen = generation;
++
++            const launch_job job = launch_jobs[rank];
++            const ggml_status status = ggml_backend_graph_compute_async(job.backend, job.graph);
++            launch_status[rank].store((int) status, std::memory_order_relaxed);
++            launch_done[rank].store(generation, std::memory_order_release);
++        }
++    }
++
++    ggml_status launch_pair(ggml_cgraph * graph0, ggml_cgraph * graph1) {
++        launch_jobs[0] = {backend_configs[0].backend, graph0};
++        launch_jobs[1] = {backend_configs[1].backend, graph1};
++
++        const uint64_t generation = launch_generation.load(std::memory_order_relaxed) + 1;
++        launch_generation.store(generation, std::memory_order_release);
++        while (launch_done[0].load(std::memory_order_acquire) != generation ||
++               launch_done[1].load(std::memory_order_acquire) != generation) {
++            std::this_thread::yield();
++        }
++
++        const ggml_status status0 = (ggml_status) launch_status[0].load(std::memory_order_relaxed);
++        const ggml_status status1 = (ggml_status) launch_status[1].load(std::memory_order_relaxed);
++        return status0 != GGML_STATUS_SUCCESS ? status0 : status1;
++    }
++
+     ggml_backend_meta_context(ggml_backend_dev_t meta_dev, const char * params) {
+         const size_t n_devs = ggml_backend_meta_dev_n_devs(meta_dev);
+         n_reduce_steps = std::ceil(std::log2(n_devs));
+@@ -1654,9 +1736,29 @@ struct ggml_backend_meta_context {
+                     ggml_backend_get_device(simple_backends[0])), "ggml_backend_comm_allreduce_tensor");
+             GGML_ASSERT(comm_allreduce != nullptr);
+         }
++
++        const char * parallel_env = std::getenv("GGML_META_PARALLEL_LAUNCH");
++        parallel_launch = n_devs == 2 && parallel_env &&
++            std::strcmp(parallel_env, "0") != 0 &&
++            std::strcmp(parallel_env, "false") != 0 &&
++            std::strcmp(parallel_env, "off") != 0;
++        if (parallel_launch) {
++            for (size_t i = 0; i < 2; ++i) {
++                launch_workers[i] = std::thread([this, i] { launch_worker_loop(i); });
++            }
++        }
+     }
+ 
+     ~ggml_backend_meta_context() {
++        if (parallel_launch) {
++            launch_stop.store(true, std::memory_order_release);
++            launch_generation.fetch_add(1, std::memory_order_release);
++            for (auto & worker : launch_workers) {
++                if (worker.joinable()) {
++                    worker.join();
++                }
++            }
++        }
+         if (comm_ctx != nullptr) {
+             ggml_backend_comm_free_t comm_free = (ggml_backend_comm_free_t) ggml_backend_reg_get_proc_address(
+                 ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_configs[0].backend)), "ggml_backend_comm_free");
+@@ -1772,6 +1874,51 @@ static void ggml_backend_meta_get_tensor_async(ggml_backend_t backend, const ggm
+     }
+ }
+ 
++static bool ggml_backend_meta_cpy_tensor_async(
++        ggml_backend_t backend_src,
++        ggml_backend_t backend_dst,
++        const ggml_tensor * src,
++        ggml_tensor * dst) {
++    GGML_UNUSED(backend_src);
++
++    const char * enabled_env = std::getenv("GGML_META_ASYNC_HOST_COPY");
++    if (enabled_env && (
++            std::strcmp(enabled_env, "0") == 0 ||
++            std::strcmp(enabled_env, "false") == 0 ||
++            std::strcmp(enabled_env, "off") == 0)) {
++        return false;
++    }
++
++    ggml_backend_buffer_t src_buf = src->view_src ? src->view_src->buffer : src->buffer;
++    ggml_backend_buffer_t dst_buf = dst->view_src ? dst->view_src->buffer : dst->buffer;
++
++    // Scheduler inputs (tokens, positions, and MTP hidden-state rows) live in
++    // ordinary host buffers.  The meta backend already knows how to splice a
++    // host tensor into every CUDA shard asynchronously; expose that path to
++    // the scheduler instead of forcing a full two-GPU stream synchronize for
++    // every individual input tensor.
++    if (!ggml_backend_is_meta(backend_dst) ||
++            !ggml_backend_buffer_is_host(src_buf) ||
++            !ggml_backend_buffer_is_meta(dst_buf) ||
++            !ggml_is_contiguous(src) || !ggml_is_contiguous(dst) ||
++            ggml_nbytes(src) != ggml_nbytes(dst)) {
++        return false;
++    }
++
++    const ggml_backend_meta_split_state split_state =
++        ggml_backend_meta_get_split_state(dst, /*assume_sync =*/ false);
++    if (split_state.n_segments != 1 || split_state.nr[0] != 1 ||
++            (split_state.axis != GGML_BACKEND_SPLIT_AXIS_0 &&
++             split_state.axis != GGML_BACKEND_SPLIT_AXIS_1 &&
++             split_state.axis != GGML_BACKEND_SPLIT_AXIS_2 &&
++             split_state.axis != GGML_BACKEND_SPLIT_AXIS_MIRRORED)) {
++        return false;
++    }
++
++    ggml_backend_meta_set_tensor_async(backend_dst, dst, src->data, 0, ggml_nbytes(src));
++    return true;
++}
++
+ static void ggml_backend_meta_synchronize(ggml_backend_t backend) {
+     const size_t n_backends = ggml_backend_meta_n_backends(backend);
+     for (size_t i = 0; i < n_backends; i++) {
+@@ -2194,12 +2341,22 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
+ 
+ 
+     for (size_t i = 0; i < backend_ctx->n_subgraphs; i++) {
+-        for (size_t j = 0; j < n_backends; j++) {
+-            auto & bcj = backend_ctx->backend_configs[j];
+-            const ggml_status status = ggml_backend_graph_compute_async(bcj.backend, bcj.cgraphs[i].cgraph_main);
++        if (backend_ctx->parallel_launch) {
++            GGML_ASSERT(n_backends == 2);
++            const ggml_status status = backend_ctx->launch_pair(
++                backend_ctx->backend_configs[0].cgraphs[i].cgraph_main,
++                backend_ctx->backend_configs[1].cgraphs[i].cgraph_main);
+             if (status != GGML_STATUS_SUCCESS) {
+                 return status;
+             }
++        } else {
++            for (size_t j = 0; j < n_backends; j++) {
++                auto & bcj = backend_ctx->backend_configs[j];
++                const ggml_status status = ggml_backend_graph_compute_async(bcj.backend, bcj.cgraphs[i].cgraph_main);
++                if (status != GGML_STATUS_SUCCESS) {
++                    return status;
++                }
++            }
+         }
+ 
+         if (n_backends > 1 && i < backend_ctx->n_subgraphs - 1) {
+@@ -2233,7 +2390,7 @@ static const ggml_backend_i ggml_backend_meta_i = {
+     /* .get_tensor_async        = */ ggml_backend_meta_get_tensor_async,
+     /* .set_tensor_2d_async     = */ nullptr,
+     /* .get_tensor_2d_async     = */ nullptr,
+-    /* .cpy_tensor_async        = */ nullptr,
++    /* .cpy_tensor_async        = */ ggml_backend_meta_cpy_tensor_async,
+     /* .synchronize             = */ ggml_backend_meta_synchronize,
+     /* .graph_plan_create       = */ nullptr,
+     /* .graph_plan_free         = */ nullptr,
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index f6fb917..d2c8438 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -1612,13 +1612,30 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+ 
+             if (input->flags & GGML_TENSOR_FLAG_INPUT) {
+                 // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
+-                if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+-                    ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
+-                } else {
+-                    ggml_backend_synchronize(split_backend);
++                const bool copied_async = split_backend->iface.cpy_tensor_async &&
++                    split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy);
++                if (!copied_async) {
++                    if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
++                        ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
++                    } else {
++                        ggml_backend_synchronize(split_backend);
++                    }
++                    ggml_backend_tensor_copy(input, input_cpy);
+                 }
+-                ggml_backend_tensor_copy(input, input_cpy);
+             } else {
++                // Meta's host-to-device copy is enqueued on each destination
++                // shard's own compute stream.  Stream ordering therefore
++                // protects a reused scheduler copy without a host-side drain.
++                // Other backend copy implementations (notably CUDA peer copy)
++                // may enqueue on the source stream and still need the generic
++                // synchronization path below.
++                if (ggml_backend_is_meta(split_backend) &&
++                        ggml_backend_buffer_is_host(input->view_src ? input->view_src->buffer : input->buffer) &&
++                        split_backend->iface.cpy_tensor_async &&
++                        split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy)) {
++                    continue;
++                }
++
+                 // wait for the split backend to finish using the input before overwriting it
+                 if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+                     ggml_backend_event_wait(split_backend, sched->events[split_backend_id][sched->cur_copy]);
+diff --git a/ggml/src/ggml-cuda/allreduce.cu b/ggml/src/ggml-cuda/allreduce.cu
+index d56129a..4457fbc 100644
+--- a/ggml/src/ggml-cuda/allreduce.cu
++++ b/ggml/src/ggml-cuda/allreduce.cu
+@@ -6,9 +6,11 @@
+ #include "ggml-impl.h"
+ 
+ #include <algorithm>
++#include <atomic>
+ #include <cstdlib>
+ #include <cstring>
+ #include <limits>
++#include <thread>
+ 
+ // ---------------------------------------------------------------------------
+ // CUDA AllReduce for tensor-parallel inference across two GPUs.
+@@ -73,7 +75,8 @@ static constexpr size_t GGML_CUDA_AR_ARRIVAL_STRIDE = 64;
+ // Number of blocks the chunked kernel launches with.  Each block stripes a
+ // disjoint slice of the data and synchronizes through its own arrival-token
+ // slot so multiple SMs can pump PCIe stores in parallel.
+-static constexpr int GGML_CUDA_AR_KERNEL_BLOCKS = 8;
++static constexpr int GGML_CUDA_AR_KERNEL_BLOCKS_MAX = 8;
++static constexpr int GGML_CUDA_AR_KERNEL_BLOCKS_DEFAULT = 8;
+ 
+ // ---------------------------------------------------------------------------
+ // Chunked kernel AllReduce -- 2 GPUs, supports float, half, and bfloat16.
+@@ -130,9 +133,20 @@ static __global__ void ggml_cuda_ar_kernel(
+     const int count_vec = count / ELEMS_PER_VEC;
+     const int tail      = count_vec * ELEMS_PER_VEC;
+ 
++    // System-scope fences are much more expensive than the mapped-host
++    // vector stores on Volta.  Use half of each block as phase-1 writers and
++    // let every writer issue multiple strided vectors when needed; phase 3
++    // still uses the full block.  This preserves enough independent PCIe
++    // requests while roughly halving the number of system fences.
++    constexpr int WRITE_THREADS = 128;
++    const bool writer_active = tid < WRITE_THREADS;
++    const int  writer_gtid   = bid * WRITE_THREADS + tid;
++    const int  writer_gnt    = gridDim.x * WRITE_THREADS;
++    bool       wrote         = false;
++
+     // Phase 1: cast sendbuf (T_dst) -> host_mine (T_wire) and store as vectors.
+     {
+-        for (int i = gtid; i < count_vec; i += gnt) {
++        for (int i = writer_gtid; writer_active && i < count_vec; i += writer_gnt) {
+             const int off = i * ELEMS_PER_VEC;
+             T_wire wire[ELEMS_PER_VEC];
+             #pragma unroll
+@@ -140,14 +154,21 @@ static __global__ void ggml_cuda_ar_kernel(
+                 wire[k] = ggml_cuda_cast<T_wire>(sendbuf[off + k]);
+             }
+             ggml_cuda_memcpy_1<sizeof(wire)>(&host_mine[off], wire);
++            wrote = true;
+         }
+         if (bid == 0 && tid < count - tail) {
+             host_mine[tail + tid] = ggml_cuda_cast<T_wire>(sendbuf[tail + tid]);
++            wrote = true;
+         }
+     }
+ 
+-    // Commit this block's host writes before signalling.
+-    __threadfence_system();
++    // Commit every writer's mapped-host stores before the block signals.  A
++    // fence only orders memory operations issued by the calling CUDA thread,
++    // so this cannot be collapsed into a thread-0-only fence after the block
++    // barrier.
++    if (wrote) {
++        __threadfence_system();
++    }
+     __syncthreads();
+ 
+     // Phase 2: thread 0 of each block signals on its own arrival slot, then
+@@ -158,7 +179,7 @@ static __global__ void ggml_cuda_ar_kernel(
+         const int * other_slot = arrival_other + bid * ARRIVAL_INTS;
+ 
+         ggml_cuda_ar_signal_set(my_slot, token);
+-        __threadfence_system(); // make our signal visible system-wide
++        __threadfence_system();
+ 
+         while (ggml_cuda_ar_signal_get(other_slot) != token) {
+ #if __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
+@@ -171,7 +192,6 @@ static __global__ void ggml_cuda_ar_kernel(
+ 
+     __syncthreads();
+ 
+-    // Acquire peer's host_other writes (this block's stripe of them).
+     __threadfence_system();
+ 
+     // Phase 3: read peer's T_wire vector, cast both sides through T_wire for
+@@ -197,6 +217,50 @@ static __global__ void ggml_cuda_ar_kernel(
+     }
+ }
+ 
++// Launch the two rendezvous kernels as one cooperative multi-device launch.
++// On PCIe V100 the ordinary rank-0-then-rank-1 launch sequence leaves rank 0
++// spinning for tens of microseconds at every TP reduction.  Both devices
++// advertise cudaDevAttrCooperativeMultiDeviceLaunch, and the no-pre/no-post
++// synchronization flags preserve the existing per-stream ordering while
++// allowing the driver to dispatch both ranks together.
++template <typename T_dst, typename T_wire>
++static cudaError_t ggml_cuda_ar_launch_multi_device(
++        T_dst       * data[2],
++        T_wire      * host_mine[2],
++        const T_wire * host_other[2],
++        int           count,
++        int         * arrival_mine[2],
++        int         * arrival_other[2],
++        int           token,
++        int           blocks,
++        cudaStream_t   streams[2]) {
++    cudaLaunchParams params[2] = {};
++    void * args[2][8] = {};
++
++    for (int i = 0; i < 2; ++i) {
++        args[i][0] = &data[i];
++        args[i][1] = &data[i];
++        args[i][2] = &host_mine[i];
++        args[i][3] = &host_other[i];
++        args[i][4] = &count;
++        args[i][5] = &arrival_mine[i];
++        args[i][6] = &arrival_other[i];
++        args[i][7] = &token;
++
++        params[i].func      = reinterpret_cast<void *>(ggml_cuda_ar_kernel<T_dst, T_wire>);
++        params[i].gridDim   = dim3(blocks);
++        params[i].blockDim  = dim3(256);
++        params[i].args      = args[i];
++        params[i].sharedMem = 0;
++        params[i].stream    = streams[i];
++    }
++
++    return cudaLaunchCooperativeKernelMultiDevice(
++        params, 2,
++        cudaCooperativeLaunchMultiDeviceNoPreSync |
++        cudaCooperativeLaunchMultiDeviceNoPostSync);
++}
++
+ // Combined load-convert-add kernel.  The peer's contribution arrives as T_src
+ // (which may be a lower-precision type than T_dst when the BF16 round-trip is
+ // active).  For bit-equivalence between the two GPUs, dst is first rounded
+@@ -261,6 +325,18 @@ struct ggml_cuda_ar_event_slot {
+     cudaEvent_t ker = nullptr;  // AllReduce kernel complete
+ };
+ 
++struct ggml_cuda_ar_worker_job {
++    float        * data        = nullptr;
++    half         * host_mine   = nullptr;
++    const half   * host_other  = nullptr;
++    int            count       = 0;
++    int          * arrival_mine  = nullptr;
++    int          * arrival_other = nullptr;
++    int            token       = 0;
++    int            blocks      = 0;
++    cudaStream_t   stream      = nullptr;
++};
++
+ // Mapped pinned host allocation: cudaHostAlloc + cudaHostGetDevicePointer
+ // in one place, with the host handle preserved for cudaFreeHost.  Used where
+ // the CPU never touches the buffer -- only the device reads/writes via the
+@@ -304,8 +380,21 @@ struct ggml_cuda_ar_pipeline {
+     size_t   copy_threshold;
+     size_t   copy_chunk_bytes;
+     size_t   bf16_threshold; // tensors >= this size (bytes) are reduced via FP32->BF16 round-trip; 0 disables
++    bool     f16_wire;       // use native FP16 rather than emulated BF16 for F32 reductions (useful on Volta)
++    int      kernel_blocks;  // runtime-tunable block count for latency-sensitive mapped-host reductions
++    bool     adaptive_blocks; // use fewer rendezvous blocks for very small decode tensors
++    bool     multi_device_launch; // dispatch both rank kernels in one cooperative launch
++    bool     worker_launch;    // launch ranks concurrently from device-affine CPU workers
++    bool     skip_kernel_events; // chunk ring is protected by in-kernel lockstep
+     uint64_t call_count;
+ 
++    ggml_cuda_ar_worker_job worker_jobs[2];
++    std::thread             workers[2];
++    std::atomic<uint64_t>   worker_generation;
++    std::atomic<uint64_t>   worker_done[2];
++    std::atomic<int>        worker_error[2];
++    std::atomic<bool>       worker_stop;
++
+     // Per-device resources.
+     ggml_cuda_ar_host_mapping host_buf[GGML_CUDA_MAX_DEVICES];   // pinned staging (chunked kernel)
+     ggml_cuda_ar_host_mapping host_large[GGML_CUDA_MAX_DEVICES]; // pinned staging (copy-engine)
+@@ -333,11 +422,47 @@ struct ggml_cuda_ar_pipeline {
+     ggml_cuda_ar_host_mapping arrival;
+ };
+ 
++static void ggml_cuda_ar_worker_loop(ggml_cuda_ar_pipeline * p, int rank) {
++    ggml_cuda_set_device(p->devices[rank]);
++    uint64_t seen = 0;
++
++    while (true) {
++        const uint64_t generation = p->worker_generation.load(std::memory_order_acquire);
++        if (generation == seen) {
++            continue;
++        }
++        if (p->worker_stop.load(std::memory_order_acquire)) {
++            return;
++        }
++        seen = generation;
++
++        const ggml_cuda_ar_worker_job job = p->worker_jobs[rank];
++        ggml_cuda_ar_kernel<float, half><<<dim3(job.blocks), dim3(256), 0, job.stream>>>(
++            job.data, job.data, job.host_mine, job.host_other, job.count,
++            job.arrival_mine, job.arrival_other, job.token);
++        p->worker_error[rank].store((int) cudaGetLastError(), std::memory_order_relaxed);
++        p->worker_done[rank].store(generation, std::memory_order_release);
++    }
++}
++
++static cudaError_t ggml_cuda_ar_launch_workers(ggml_cuda_ar_pipeline * p) {
++    const uint64_t generation = p->worker_generation.load(std::memory_order_relaxed) + 1;
++    p->worker_generation.store(generation, std::memory_order_release);
++
++    while (p->worker_done[0].load(std::memory_order_acquire) != generation ||
++           p->worker_done[1].load(std::memory_order_acquire) != generation) {
++    }
++
++    const cudaError_t error0 = (cudaError_t) p->worker_error[0].load(std::memory_order_relaxed);
++    const cudaError_t error1 = (cudaError_t) p->worker_error[1].load(std::memory_order_relaxed);
++    return error0 != cudaSuccess ? error0 : error1;
++}
++
+ // Base pointer for the (slot, rank) per-block token block.  The kernel adds
+ // blockIdx.x * (ARRIVAL_STRIDE/sizeof(int)) internally to land on its own slot.
+ static int * ggml_cuda_ar_arrival_ptr(const ggml_cuda_ar_pipeline * p, int slot, int rank) {
+     const size_t offset = ((size_t)slot * p->n_devices + rank) *
+-                          GGML_CUDA_AR_KERNEL_BLOCKS * GGML_CUDA_AR_ARRIVAL_STRIDE;
++                          GGML_CUDA_AR_KERNEL_BLOCKS_MAX * GGML_CUDA_AR_ARRIVAL_STRIDE;
+     return reinterpret_cast<int *>(p->arrival.dev + offset);
+ }
+ 
+@@ -357,12 +482,13 @@ struct ggml_cuda_ar_slot_info {
+     int token;
+ };
+ 
+-static ggml_cuda_ar_slot_info ggml_cuda_ar_acquire_slot(ggml_cuda_ar_pipeline * p) {
++static ggml_cuda_ar_slot_info ggml_cuda_ar_acquire_slot(
++        ggml_cuda_ar_pipeline * p, bool synchronize_reused_slot = true) {
+     const int  slot        = static_cast<int>(p->call_count % GGML_CUDA_AR_POOL_SIZE);
+     const bool pool_lapped = p->call_count >= GGML_CUDA_AR_POOL_SIZE;
+     p->call_count++;
+ 
+-    if (pool_lapped) {
++    if (pool_lapped && synchronize_reused_slot) {
+         for (int i = 0; i < p->n_devices; ++i) {
+             ggml_cuda_set_device(p->devices[i]);
+             CUDA_CHECK(cudaEventSynchronize(p->ev_pool[i][slot].ker));
+@@ -428,8 +554,33 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n
+     // ne).  Set GGML_CUDA_AR_BF16_THRESHOLD=0 to disable, or to a larger
+     // byte threshold to opt out for small tensors.
+     p->bf16_threshold   = ggml_cuda_ar_env_u64("GGML_CUDA_AR_BF16_THRESHOLD", 1);
++    p->f16_wire         = ggml_cuda_ar_env_u64("GGML_CUDA_AR_F16_WIRE", 0) != 0;
++    p->kernel_blocks    = (int) ggml_cuda_ar_env_u64(
++        "GGML_CUDA_AR_KERNEL_BLOCKS", GGML_CUDA_AR_KERNEL_BLOCKS_DEFAULT);
++    p->adaptive_blocks  = ggml_cuda_ar_env_u64("GGML_CUDA_AR_ADAPTIVE_BLOCKS", 0) != 0;
++    p->multi_device_launch = ggml_cuda_ar_env_u64("GGML_CUDA_AR_MULTI_DEVICE_LAUNCH", 0) != 0;
++    p->worker_launch = ggml_cuda_ar_env_u64("GGML_CUDA_AR_WORKER_LAUNCH", 0) != 0;
++    p->skip_kernel_events = ggml_cuda_ar_env_u64("GGML_CUDA_AR_SKIP_KERNEL_EVENTS", 0) != 0;
++    if (p->worker_launch) {
++        p->multi_device_launch = false;
++    }
++    if (p->kernel_blocks < 1 || p->kernel_blocks > GGML_CUDA_AR_KERNEL_BLOCKS_MAX) {
++        GGML_LOG_WARN("%s: GGML_CUDA_AR_KERNEL_BLOCKS=%d outside [1,%d]; using %d\n",
++                      __func__, p->kernel_blocks, GGML_CUDA_AR_KERNEL_BLOCKS_MAX,
++                      GGML_CUDA_AR_KERNEL_BLOCKS_DEFAULT);
++        p->kernel_blocks = GGML_CUDA_AR_KERNEL_BLOCKS_DEFAULT;
++    }
+     for (size_t i = 0; i < n_devices; ++i) {
+         p->devices[i] = devices[i];
++        if (p->multi_device_launch) {
++            int supported = 0;
++            ggml_cuda_set_device(p->devices[i]);
++            if (cudaDeviceGetAttribute(&supported, cudaDevAttrCooperativeMultiDeviceLaunch, p->devices[i]) != cudaSuccess || !supported) {
++                GGML_LOG_WARN("%s: cooperative multi-device launch unsupported on device %d; disabling\n",
++                              __func__, p->devices[i]);
++                p->multi_device_launch = false;
++            }
++        }
+     }
+ 
+     // Per-device streams and event pools.
+@@ -478,7 +629,7 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n
+     // Arrival ring: cache-line padded so each GPU's int is on its own line.
+     const size_t arrival_bytes =
+         (size_t)GGML_CUDA_AR_POOL_SIZE * n_devices *
+-        GGML_CUDA_AR_KERNEL_BLOCKS * GGML_CUDA_AR_ARRIVAL_STRIDE;
++        GGML_CUDA_AR_KERNEL_BLOCKS_MAX * GGML_CUDA_AR_ARRIVAL_STRIDE;
+     if (p->arrival.alloc(arrival_bytes) != cudaSuccess) {
+         GGML_LOG_ERROR("%s: alloc for arrival ring failed (%zu bytes)\n",
+                        __func__, arrival_bytes);
+@@ -531,6 +682,16 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n
+                   "%zu KB chunked kernel staging + %zu MB copy-engine staging per GPU\n",
+                   __func__, n_devices, p->buf_bytes >> 10, p->copy_bytes >> 20);
+ 
++    if (p->worker_launch) {
++        p->worker_generation.store(0, std::memory_order_relaxed);
++        p->worker_stop.store(false, std::memory_order_relaxed);
++        for (int i = 0; i < 2; ++i) {
++            p->worker_done[i].store(0, std::memory_order_relaxed);
++            p->worker_error[i].store((int) cudaSuccess, std::memory_order_relaxed);
++            p->workers[i] = std::thread(ggml_cuda_ar_worker_loop, p, i);
++        }
++    }
++
+     return p;
+ }
+ 
+@@ -539,6 +700,16 @@ void ggml_cuda_ar_pipeline_free(ggml_cuda_ar_pipeline * p) {
+         return;
+     }
+ 
++    if (p->worker_launch) {
++        p->worker_stop.store(true, std::memory_order_release);
++        p->worker_generation.fetch_add(1, std::memory_order_release);
++        for (int i = 0; i < 2; ++i) {
++            if (p->workers[i].joinable()) {
++                p->workers[i].join();
++            }
++        }
++    }
++
+     // Drain all in-flight kernels before tearing down resources.
+     for (int i = 0; i < p->n_devices; ++i) {
+         if (p->streams[i]) {
+@@ -761,12 +932,13 @@ bool ggml_cuda_ar_allreduce(
+     // the reduction (chunked or copy-engine), halving on-wire bytes. Matches
+     // NCCL's behaviour. The pre-conversion zeroes inactive shards so the
+     // inner paths see them as already-prepared compute tensors.
+-    const bool use_bf16 =
++    const bool use_lowp_wire =
+         input_type == GGML_TYPE_F32 &&
+         p->bf16_threshold > 0 &&
+         input_nbytes >= p->bf16_threshold;
++    const bool use_f16_wire = use_lowp_wire && p->f16_wire;
+ 
+-    const ggml_type kernel_type = use_bf16 ? GGML_TYPE_BF16 : input_type;
++    const ggml_type kernel_type = use_lowp_wire ? (use_f16_wire ? GGML_TYPE_F16 : GGML_TYPE_BF16) : input_type;
+     const size_t    type_size   = ggml_type_size(kernel_type);
+     GGML_ASSERT(p->buf_bytes >= type_size);
+     const size_t    nbytes      = (size_t) ne * type_size;
+@@ -787,7 +959,7 @@ bool ggml_cuda_ar_allreduce(
+     // (chunked kernel path) and the combined add kernel (copy_engine path)
+     // both accumulate into the F32 tensor data directly, so an inactive
+     // shard's accumulator must start at zero.
+-    if (use_bf16) {
++    if (use_lowp_wire) {
+         for (int i = 0; i < n; ++i) {
+             if (!compute_flag[i]) {
+                 auto * cuda_ctx = static_cast<ggml_backend_cuda_context *>(backends[i]->context);
+@@ -802,23 +974,35 @@ bool ggml_cuda_ar_allreduce(
+     // path; the chunked kernel path's combined kernel does the conversion
+     // inline as it writes to host_buf.
+     ggml_cuda_pool_alloc<nv_bfloat16> bf16_tmp[GGML_CUDA_MAX_DEVICES];
++    ggml_cuda_pool_alloc<half>         f16_tmp[GGML_CUDA_MAX_DEVICES];
+     void * copy_src_ptr[GGML_CUDA_MAX_DEVICES] = {};
+ 
+-    if (use_copy_engine && use_bf16) {
+-        to_bf16_cuda_t to_bf16 = ggml_get_to_bf16_cuda(GGML_TYPE_F32);
++    if (use_copy_engine && use_lowp_wire) {
++        to_bf16_cuda_t to_bf16 = use_f16_wire ? nullptr : ggml_get_to_bf16_cuda(GGML_TYPE_F32);
++        to_fp16_cuda_t to_f16   = use_f16_wire ? ggml_get_to_fp16_cuda(GGML_TYPE_F32) : nullptr;
+         for (int i = 0; i < n; ++i) {
+             auto * cuda_ctx = static_cast<ggml_backend_cuda_context *>(backends[i]->context);
+             GGML_ASSERT(cuda_ctx->device == p->devices[i]);
+-            bf16_tmp[i].pool = &cuda_ctx->pool();
+-            bf16_tmp[i].alloc(ne);
++            if (use_f16_wire) {
++                f16_tmp[i].pool = &cuda_ctx->pool();
++                f16_tmp[i].alloc(ne);
++                copy_src_ptr[i] = f16_tmp[i].get();
++            } else {
++                bf16_tmp[i].pool = &cuda_ctx->pool();
++                bf16_tmp[i].alloc(ne);
++                copy_src_ptr[i] = bf16_tmp[i].get();
++            }
+             ggml_cuda_set_device(p->devices[i]);
+             if (compute_flag[i]) {
+-                to_bf16(tensors[i]->data, bf16_tmp[i].get(), ne, cuda_ctx->stream());
++                if (use_f16_wire) {
++                    to_f16(tensors[i]->data, f16_tmp[i].get(), ne, cuda_ctx->stream());
++                } else {
++                    to_bf16(tensors[i]->data, bf16_tmp[i].get(), ne, cuda_ctx->stream());
++                }
+                 CUDA_CHECK(cudaGetLastError());
+             } else {
+-                CUDA_CHECK(cudaMemsetAsync(bf16_tmp[i].get(), 0, nbytes, cuda_ctx->stream()));
++                CUDA_CHECK(cudaMemsetAsync(copy_src_ptr[i], 0, nbytes, cuda_ctx->stream()));
+             }
+-            copy_src_ptr[i] = bf16_tmp[i].get();
+         }
+     }
+ 
+@@ -829,7 +1013,7 @@ bool ggml_cuda_ar_allreduce(
+         // every shard as compute.
+         bool inner_compute[GGML_CUDA_MAX_DEVICES];
+         for (int i = 0; i < n; ++i) {
+-            inner_compute[i] = use_bf16 ? true : compute_flag[i];
++            inner_compute[i] = use_lowp_wire ? true : compute_flag[i];
+         }
+ 
+         // Dispatch into copy_impl with explicit src/dst types.  When use_bf16
+@@ -837,16 +1021,28 @@ bool ggml_cuda_ar_allreduce(
+         // is F32 (dst = tensors[i]->data); the combined add kernel rounds dst
+         // through BF16 for bit-equivalence and writes F32 directly, so no
+         // post-conversion is needed.  Otherwise src == dst (same native type).
+-        if (use_bf16) {
+-            GGML_ASSERT(kernel_type == GGML_TYPE_BF16);
+-            nv_bfloat16 * src[GGML_CUDA_MAX_DEVICES] = {};
+-            float       * dst[GGML_CUDA_MAX_DEVICES] = {};
++        if (use_lowp_wire) {
++            float * dst[GGML_CUDA_MAX_DEVICES] = {};
+             for (int i = 0; i < n; ++i) {
+-                src[i] = static_cast<nv_bfloat16 *>(copy_src_ptr[i]);
+                 dst[i] = static_cast<float *>(tensors[i]->data);
+             }
+-            ok = ggml_cuda_ar_allreduce_copy_outer<nv_bfloat16, float>(
+-                p, backends, src, dst, inner_compute, ne);
++            if (use_f16_wire) {
++                GGML_ASSERT(kernel_type == GGML_TYPE_F16);
++                half * src[GGML_CUDA_MAX_DEVICES] = {};
++                for (int i = 0; i < n; ++i) {
++                    src[i] = static_cast<half *>(copy_src_ptr[i]);
++                }
++                ok = ggml_cuda_ar_allreduce_copy_outer<half, float>(
++                    p, backends, src, dst, inner_compute, ne);
++            } else {
++                GGML_ASSERT(kernel_type == GGML_TYPE_BF16);
++                nv_bfloat16 * src[GGML_CUDA_MAX_DEVICES] = {};
++                for (int i = 0; i < n; ++i) {
++                    src[i] = static_cast<nv_bfloat16 *>(copy_src_ptr[i]);
++                }
++                ok = ggml_cuda_ar_allreduce_copy_outer<nv_bfloat16, float>(
++                    p, backends, src, dst, inner_compute, ne);
++            }
+         } else {
+             switch (kernel_type) {
+                 case GGML_TYPE_F32: {
+@@ -896,10 +1092,111 @@ bool ggml_cuda_ar_allreduce(
+             const size_t remaining_elems = (size_t) (ne - chunk_start);
+             const size_t chunk_elems = remaining_elems < max_chunk_elems ? remaining_elems : max_chunk_elems;
+             const size_t chunk_dst_bytes  = chunk_elems * input_type_size;
++            int launch_blocks = p->kernel_blocks;
++            if (p->adaptive_blocks) {
++                if (chunk_elems <= 8192) {
++                    launch_blocks = 1;
++                } else if (chunk_elems <= 16384) {
++                    launch_blocks = std::min(launch_blocks, 2);
++                }
++            }
+ 
+-            const auto [slot, token] = ggml_cuda_ar_acquire_slot(p);
++            // The chunked path runs on each device's ordered compute stream.
++            // Reusing a two-entry slot ring is safe without a host-side
++            // cudaEventSynchronize: before rank A can execute AR N+2 it must
++            // finish N+1, and N+1's in-kernel rendezvous cannot finish until
++            // rank B has completed N and reached N+1.  Consequently both
++            // ranks have consumed slot N before either can overwrite it for
++            // N+2.  Avoiding the CPU wait is important for decode, which has
++            // hundreds of small reductions per token.
++            const auto [slot, token] = ggml_cuda_ar_acquire_slot(p, false);
+             const bool last_chunk = chunk_start + (int64_t) chunk_elems == ne;
+ 
++            if (p->worker_launch) {
++                GGML_ASSERT(use_lowp_wire && use_f16_wire && input_type == GGML_TYPE_F32);
++                for (int i = 0; i < n; ++i) {
++                    const int peer = 1 - i;
++                    auto * cuda_ctx = static_cast<ggml_backend_cuda_context *>(backends[i]->context);
++                    GGML_ASSERT(cuda_ctx->device == p->devices[i]);
++
++                    char * data = static_cast<char *>(tensors[i]->data) + chunk_start * (int64_t) input_type_size;
++                    if (!compute_flag[i]) {
++                        ggml_cuda_set_device(p->devices[i]);
++                        CUDA_CHECK(cudaMemsetAsync(data, 0, chunk_dst_bytes, cuda_ctx->stream()));
++                    }
++
++                    p->worker_jobs[i] = {
++                        reinterpret_cast<float *>(data),
++                        reinterpret_cast<half *>(p->host_buf[i].dev + (size_t) slot * p->buf_bytes),
++                        reinterpret_cast<const half *>(p->host_buf[peer].dev + (size_t) slot * p->buf_bytes),
++                        static_cast<int>(chunk_elems),
++                        ggml_cuda_ar_arrival_ptr(p, slot, i),
++                        ggml_cuda_ar_arrival_ptr(p, slot, peer),
++                        token,
++                        launch_blocks,
++                        cuda_ctx->stream(),
++                    };
++                }
++
++                CUDA_CHECK(ggml_cuda_ar_launch_workers(p));
++
++                // The chunked path's lockstep rendezvous makes the two-slot
++                // host ring safe without host-visible completion events.  A
++                // later copy-engine reduction has its own staging buffers and
++                // orders itself after compute through ev.app.
++                GGML_UNUSED(last_chunk);
++                continue;
++            }
++
++            if (p->multi_device_launch) {
++                float *       data_f32[2]       = {};
++                half *        host_mine_f16[2]  = {};
++                const half *  host_other_f16[2] = {};
++                int *         arrival_mine[2]   = {};
++                int *         arrival_other[2]  = {};
++                cudaStream_t  streams[2]        = {};
++
++                for (int i = 0; i < n; ++i) {
++                    const int peer = 1 - i;
++                    ggml_cuda_set_device(p->devices[i]);
++                    auto * cuda_ctx = static_cast<ggml_backend_cuda_context *>(backends[i]->context);
++                    GGML_ASSERT(cuda_ctx->device == p->devices[i]);
++                    streams[i] = cuda_ctx->stream();
++
++                    char * data = static_cast<char *>(tensors[i]->data) + chunk_start * (int64_t) input_type_size;
++                    if (!compute_flag[i] && !use_lowp_wire) {
++                        CUDA_CHECK(cudaMemsetAsync(data, 0, chunk_dst_bytes, streams[i]));
++                    }
++
++                    data_f32[i]       = reinterpret_cast<float *>(data);
++                    host_mine_f16[i]  = reinterpret_cast<half *>(
++                        p->host_buf[i].dev + (size_t) slot * p->buf_bytes);
++                    host_other_f16[i] = reinterpret_cast<const half *>(
++                        p->host_buf[peer].dev + (size_t) slot * p->buf_bytes);
++                    arrival_mine[i]   = ggml_cuda_ar_arrival_ptr(p, slot, i);
++                    arrival_other[i]  = ggml_cuda_ar_arrival_ptr(p, slot, peer);
++                }
++
++                // V100-X1 uses F32 accumulation with an F16 wire.  Keep the
++                // experimental launch narrowly scoped to that exact path;
++                // all other type combinations retain the established code.
++                GGML_ASSERT(use_lowp_wire && use_f16_wire && input_type == GGML_TYPE_F32);
++                ggml_cuda_set_device(p->devices[0]);
++                const cudaError_t launch_rc = ggml_cuda_ar_launch_multi_device<float, half>(
++                    data_f32, host_mine_f16, host_other_f16,
++                    static_cast<int>(chunk_elems), arrival_mine, arrival_other,
++                    token, launch_blocks, streams);
++                CUDA_CHECK(launch_rc);
++
++                if (last_chunk && !p->skip_kernel_events) {
++                    for (int i = 0; i < n; ++i) {
++                        ggml_cuda_set_device(p->devices[i]);
++                        CUDA_CHECK(cudaEventRecord(p->ev_pool[i][slot].ker, streams[i]));
++                    }
++                }
++                continue;
++            }
++
+             for (int i = 0; i < n; ++i) {
+                 const int peer = 1 - i;  // valid for n == 2 only
+                 ggml_cuda_set_device(p->devices[i]);
+@@ -912,12 +1209,12 @@ bool ggml_cuda_ar_allreduce(
+                 // Match NCCL/meta-backend semantics: inactive shards contribute
+                 // zeros.  On the BF16 path the F32 tensor data was already
+                 // zeroed up-front (above), so per-chunk zeroing isn't needed.
+-                if (!compute_flag[i] && !use_bf16) {
++                if (!compute_flag[i] && !use_lowp_wire) {
+                     CUDA_CHECK(cudaMemsetAsync(data, 0, chunk_dst_bytes, stream));
+                 }
+ 
+ #define LAUNCH_AR_KERNEL(T_dst, T_wire) \
+-                ggml_cuda_ar_kernel<T_dst, T_wire><<<dim3(GGML_CUDA_AR_KERNEL_BLOCKS), dim3(256), 0, stream>>>( \
++                ggml_cuda_ar_kernel<T_dst, T_wire><<<dim3(launch_blocks), dim3(256), 0, stream>>>( \
+                     reinterpret_cast<const T_dst *>(data), \
+                     reinterpret_cast<T_dst *>(data), \
+                     reinterpret_cast<T_wire *>(p->host_buf[i].dev + (size_t) slot * p->buf_bytes), \
+@@ -927,9 +1224,13 @@ bool ggml_cuda_ar_allreduce(
+                     ggml_cuda_ar_arrival_ptr(p, slot, peer), \
+                     token)
+ 
+-                if (use_bf16) {
++                if (use_lowp_wire) {
+                     GGML_ASSERT(input_type == GGML_TYPE_F32);
+-                    LAUNCH_AR_KERNEL(float, nv_bfloat16);
++                    if (use_f16_wire) {
++                        LAUNCH_AR_KERNEL(float, half);
++                    } else {
++                        LAUNCH_AR_KERNEL(float, nv_bfloat16);
++                    }
+                 } else {
+                     switch (input_type) {
+                         case GGML_TYPE_F32:  LAUNCH_AR_KERNEL(float,       float);       break;
+@@ -942,7 +1243,7 @@ bool ggml_cuda_ar_allreduce(
+ #undef LAUNCH_AR_KERNEL
+                 CUDA_CHECK(cudaGetLastError());
+ 
+-                if (last_chunk) {
++                if (last_chunk && !p->skip_kernel_events) {
+                     CUDA_CHECK(cudaEventRecord(p->ev_pool[i][slot].ker, stream));
+                 }
+             }
+diff --git a/ggml/src/ggml-cuda/argmax.cu b/ggml/src/ggml-cuda/argmax.cu
+index 51967c6..c1d7bf5 100644
+--- a/ggml/src/ggml-cuda/argmax.cu
++++ b/ggml/src/ggml-cuda/argmax.cu
+@@ -5,6 +5,18 @@
+ #include "common.cuh"
+ #include "sum.cuh"
+ 
++static __device__ __forceinline__ void argmax_warp_reduce(float & maxval, int & argmax) {
++#pragma unroll
++    for (int offset = WARP_SIZE/2; offset > 0; offset >>= 1) {
++        const float val = __shfl_xor_sync(0xFFFFFFFF, maxval, offset, WARP_SIZE);
++        const int   col = __shfl_xor_sync(0xFFFFFFFF, argmax, offset, WARP_SIZE);
++        if (val > maxval) {
++            maxval = val;
++            argmax = col;
++        }
++    }
++}
++
+ static __global__ void argmax_f32(const float * __restrict__ x, int32_t * __restrict__ dst, const int64_t ncols) {
+     const int64_t row = blockIdx.x;
+ 
+@@ -12,23 +24,15 @@ static __global__ void argmax_f32(const float * __restrict__ x, int32_t * __rest
+     int   argmax = -1;
+     const float * rowx = x + row * ncols;
+ 
+-    for (int32_t col = threadIdx.x; col < ncols; col += blockDim.x) {
++    for (int64_t col = threadIdx.x; col < ncols; col += blockDim.x) {
+         const float val = rowx[col];
+         if (val > maxval) {
+             maxval = val;
+-            argmax = col;
++            argmax = (int) col;
+         }
+     }
+ 
+-#pragma unroll
+-    for (int offset = WARP_SIZE/2; offset > 0; offset >>= 1) {
+-        const float val = __shfl_xor_sync(0xFFFFFFFF, maxval, offset, WARP_SIZE);
+-        const int   col = __shfl_xor_sync(0xFFFFFFFF, argmax, offset, WARP_SIZE);
+-        if (val > maxval) {
+-            maxval = val;
+-            argmax = col;
+-        }
+-    }
++    argmax_warp_reduce(maxval, argmax);
+ 
+     const int n_warps = blockDim.x / WARP_SIZE;
+     const int lane_id = threadIdx.x % WARP_SIZE;
+@@ -49,15 +53,7 @@ static __global__ void argmax_f32(const float * __restrict__ x, int32_t * __rest
+                 maxval = shared_maxval[lane_id];
+                 argmax = shared_argmax[lane_id];
+             }
+-#pragma unroll
+-            for (int offset = WARP_SIZE/2; offset > 0; offset >>= 1) {
+-                const float val = __shfl_xor_sync(0xFFFFFFFF, maxval, offset, WARP_SIZE);
+-                const int   col = __shfl_xor_sync(0xFFFFFFFF, argmax, offset, WARP_SIZE);
+-                if (val > maxval) {
+-                    maxval = val;
+-                    argmax = col;
+-                }
+-            }
++            argmax_warp_reduce(maxval, argmax);
+         }
+     }
+ 
+@@ -66,6 +62,58 @@ static __global__ void argmax_f32(const float * __restrict__ x, int32_t * __rest
+     }
+ }
+ 
++// one warp per chunk of a row, writing the chunk-local (val, idx)
++static __global__ void argmax_f32_chunk(const float * __restrict__ x, float * __restrict__ part_val, int32_t * __restrict__ part_idx,
++        const int64_t ncols, const int64_t nchunks) {
++    const int64_t row        = blockIdx.x / nchunks;
++    const int64_t chunk      = blockIdx.x % nchunks;
++    const int64_t chunk_size = (ncols + nchunks - 1) / nchunks;
++    const int64_t beg        = chunk * chunk_size;
++    const int64_t end        = beg + chunk_size < ncols ? beg + chunk_size : ncols;
++
++    float maxval = -FLT_MAX;
++    int   argmax = -1;
++    const float * rowx = x + row * ncols;
++
++    for (int64_t col = beg + threadIdx.x; col < end; col += WARP_SIZE) {
++        const float val = rowx[col];
++        if (val > maxval) {
++            maxval = val;
++            argmax = (int) col;
++        }
++    }
++
++    argmax_warp_reduce(maxval, argmax);
++
++    if (threadIdx.x == 0) {
++        part_val[row*nchunks + chunk] = maxval;
++        part_idx[row*nchunks + chunk] = argmax;
++    }
++}
++
++// one warp per row, reducing the per-chunk partials to the row's column index
++static __global__ void argmax_f32_combine(const float * __restrict__ part_val, const int32_t * __restrict__ part_idx,
++        int32_t * __restrict__ dst, const int64_t nchunks) {
++    const int64_t row = blockIdx.x;
++
++    float maxval = -FLT_MAX;
++    int   argmax = -1;
++
++    for (int i = threadIdx.x; i < nchunks; i += WARP_SIZE) {
++        const float val = part_val[row*nchunks + i];
++        if (val > maxval) {
++            maxval = val;
++            argmax = part_idx[row*nchunks + i];
++        }
++    }
++
++    argmax_warp_reduce(maxval, argmax);
++
++    if (threadIdx.x == 0) {
++        dst[row] = argmax;
++    }
++}
++
+ void ggml_cuda_argmax(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     const ggml_tensor * src0 = dst->src[0];
+ 
+@@ -77,11 +125,28 @@ void ggml_cuda_argmax(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     const int64_t ne00  = src0->ne[0];
+     const int64_t nrows = ggml_nrows(src0);
+ 
++    // the result indices are I32
++    GGML_ASSERT(ne00 <= INT32_MAX);
++
+     const float * src0_d = (const float *) src0->data;
+     int32_t     * dst_d  = (int32_t     *) dst->data;
+ 
+     cudaStream_t stream = ctx.stream();
+ 
++    // one block per row leaves most SMs idle for few large rows -> reduce chunks first
++    const int64_t nchunks = ne00 < 8192 ? 0 :
++        std::min<int64_t>(ne00/128, 8*ggml_cuda_info().devices[ggml_cuda_get_device()].nsm/nrows);
++
++    if (nchunks >= 4) {
++        ggml_cuda_pool_alloc<float>   part_val(ctx.pool(), nrows*nchunks);
++        ggml_cuda_pool_alloc<int32_t> part_idx(ctx.pool(), nrows*nchunks);
++
++        argmax_f32_chunk<<<dim3(nrows*nchunks, 1, 1), dim3(WARP_SIZE, 1, 1), 0, stream>>>(src0_d, part_val.get(), part_idx.get(), ne00, nchunks);
++        argmax_f32_combine<<<dim3(nrows, 1, 1), dim3(WARP_SIZE, 1, 1), 0, stream>>>(part_val.get(), part_idx.get(), dst_d, nchunks);
++
++        return;
++    }
++
+     const int64_t num_blocks = nrows;
+     const int64_t num_threads = std::min<int64_t>(1024, (ne00 + WARP_SIZE - 1) / WARP_SIZE * WARP_SIZE);
+     const dim3 blocks_dim(num_threads, 1, 1);
+diff --git a/ggml/src/ggml-cuda/fattn-mma-f16.cuh b/ggml/src/ggml-cuda/fattn-mma-f16.cuh
+index 7f4cfd5..cd747c3 100644
+--- a/ggml/src/ggml-cuda/fattn-mma-f16.cuh
++++ b/ggml/src/ggml-cuda/fattn-mma-f16.cuh
+@@ -110,6 +110,12 @@ static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_co
+ }
+ 
+ static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_config_volta(const int DKQ, const int DV, const int ncols) {
++    // Keeping all 32 Q columns resident costs 255 registers and spills on
++    // sm_70.  Stage Q through shared memory instead; Volta has no cp.async, so
++    // a single synchronous stage is also the cheapest pipeline.
++    GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256, 32, 256, 1, 64, 128, 128, 64, 1, false);
++    GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256, 64, 256, 1, 64, 128, 128, 64, 1, false);
++
+     GGML_CUDA_FATTN_MMA_CONFIG_CASE(512, 512,  8,  64, 4,  32, 256, 256,  64, 1, false);
+     GGML_CUDA_FATTN_MMA_CONFIG_CASE(512, 512, 16,  64, 4,  32, 256, 256,  64, 1, false);
+     GGML_CUDA_FATTN_MMA_CONFIG_CASE(512, 512, 32, 128, 2,  32, 128, 128,  64, 1, false);
+@@ -2003,6 +2009,7 @@ DECL_FATTN_MMA_F16_CASE_ALL_NCOLS2(112, 112,  64)
+ DECL_FATTN_MMA_F16_CASE_ALL_NCOLS2(128, 128,  64)
+ DECL_FATTN_MMA_F16_CASE_ALL_NCOLS2(256, 256,  64)
+ 
++
+ extern DECL_FATTN_MMA_F16_CASE(512, 512,  4,  2);
+ extern DECL_FATTN_MMA_F16_CASE(512, 512,  8,  2);
+ extern DECL_FATTN_MMA_F16_CASE(512, 512, 16,  2);
+diff --git a/ggml/src/ggml-cuda/fattn.cu b/ggml/src/ggml-cuda/fattn.cu
+index ab7a3b2..c00cf2d 100644
+--- a/ggml/src/ggml-cuda/fattn.cu
++++ b/ggml/src/ggml-cuda/fattn.cu
+@@ -65,6 +65,15 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
+ 
+     // On Volta the GQA optimizations aren't as impactful vs. minimizing wasted compute:
+     if (cc == GGML_CUDA_CC_VOLTA) {
++        // Qwen3.8-27B: pad GQA-6 to eight heads so Q4 verification reaches the
++        // 32-column minimum needed by the Volta MMA kernel.
++        if constexpr (DKQ == 256 && DV == 256) {
++            if (use_gqa_opt && gqa_ratio == 6 && Q->ne[1] == 4) {
++                ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 8>(ctx, dst);
++                return;
++            }
++        }
++
+         if (use_gqa_opt && gqa_ratio % 8 == 0) {
+             ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 8>(ctx, dst);
+             return;
+@@ -492,6 +501,10 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
+         if (can_use_vector_kernel && Q->ne[1] * gqa_ratio_eff <= 2) {
+             return BEST_FATTN_KERNEL_VEC;
+         }
++        if (Q->ne[0] == 256 && gqa_opt_applies && gqa_ratio == 6 &&
++                Q->ne[1] == 4) {
++            return BEST_FATTN_KERNEL_MMA_F16;
++        }
+         if (Q->ne[1] * gqa_ratio_eff <= 16) {
+             return BEST_FATTN_KERNEL_TILE; // On Volta tensor cores are only faster for sufficiently large matrices.
+         }
+diff --git a/ggml/src/ggml-cuda/gated_delta_net.cu b/ggml/src/ggml-cuda/gated_delta_net.cu
+index 1b431a7..c396b21 100644
+--- a/ggml/src/ggml-cuda/gated_delta_net.cu
++++ b/ggml/src/ggml-cuda/gated_delta_net.cu
+@@ -1,8 +1,15 @@
+ #include "gated_delta_net.cuh"
+ #include "ggml-cuda/common.cuh"
+ 
++// Row-per-warp kernel derived from upstream PR #22587 and forward-ported to
++// the recurrent-state rollback/fused-cache interface on current master.
++// Four warps cooperate on 16 value rows while lanes shard the Q/K dimension.
++constexpr int GDN_DV_PER_WARP = 4;
++constexpr int GDN_NUM_WARPS   = 4;
++constexpr int GDN_BLOCK_DV    = GDN_NUM_WARPS * GDN_DV_PER_WARP;
++
+ template <int S_v, bool KDA, bool keep_rs_t>
+-__global__ void __launch_bounds__((ggml_cuda_get_physical_warp_size() < S_v ? ggml_cuda_get_physical_warp_size() : S_v) * 4, 2)
++__global__ void __launch_bounds__(ggml_cuda_get_physical_warp_size() * GDN_NUM_WARPS, 2)
+ gated_delta_net_cuda(const float * q,
+                                      const float * k,
+                                      const float * v,
+@@ -28,130 +35,148 @@ gated_delta_net_cuda(const float * q,
+                                      float         scale,
+                                      int64_t       state_slot_stride,
+                                      int           K) {
++    constexpr int warp_size     = ggml_cuda_get_physical_warp_size();
++    constexpr int active_lanes  = (S_v < warp_size) ? S_v : warp_size;
++    constexpr int d_qk_per_lane = S_v / active_lanes;
++    static_assert(d_qk_per_lane >= 1, "S_v must >= 1");
++    static_assert(S_v % active_lanes == 0, "S_v must be a multiple of active_lanes");
++    static_assert(S_v % GDN_BLOCK_DV == 0, "S_v must be a multiple of GDN_BLOCK_DV");
++
+     const uint32_t h_idx    = blockIdx.x;
+     const uint32_t sequence = blockIdx.y;
+-    // each warp owns one column, using warp-level primitives to reduce across rows
+     const int      lane     = threadIdx.x;
+-    const int      col      = blockIdx.z * blockDim.y + threadIdx.y;
++    const int      warp_id  = threadIdx.y;
++
++    const uint32_t dv_base  = blockIdx.z * GDN_BLOCK_DV + warp_id * GDN_DV_PER_WARP;
++    const uint32_t dqk_base = lane * d_qk_per_lane;
+ 
+     const uint32_t iq1 = fastmodulo(h_idx, neqk1_magic);
+     const uint32_t iq3 = fastdiv(sequence, rq3_magic);
+ 
+-    float *       attn_data        = dst;
++    float * attn_data = dst;
+ 
+     // input state holds s0 only: [S_v, S_v, H, n_seqs] — seq stride is D = H * S_v * S_v.
+     // output state layout (per-slot D * n_seqs) — same per-(seq,head) offset as before.
+     const int64_t state_in_offset      = sequence * H * S_v * S_v + h_idx * S_v * S_v;
+     const int64_t state_out_offset     = (sequence * H + h_idx) * S_v * S_v;
+     state += state_out_offset;
+-    curr_state += state_in_offset + col * S_v;
++    curr_state += state_in_offset;
+     attn_data += (sequence * n_tokens * H + h_idx) * S_v;
+ 
+-    constexpr int warp_size = ggml_cuda_get_physical_warp_size() < S_v ? ggml_cuda_get_physical_warp_size() : S_v;
+-    static_assert(S_v % warp_size == 0, "S_v must be a multiple of warp_size");
+-    constexpr int rows_per_lane = (S_v + warp_size - 1) / warp_size;
+-    float         s_shard[rows_per_lane];
+-    // state is stored transposed: M[col][i] = S[i][col], row col is contiguous
+-
+     ggml_cuda_pdl_sync();
+-#pragma unroll
+-    for (int r = 0; r < rows_per_lane; r++) {
+-        const int i = r * warp_size + lane;
+-        s_shard[r]  = curr_state[i];
+-    }
+ 
+-    for (int t = 0; t < n_tokens; t++) {
+-        const float * q_t = q + iq3 * sq3 + t * sq2 + iq1 * sq1;
+-        const float * k_t = k + iq3 * sq3 + t * sq2 + iq1 * sq1;
+-        const float * v_t = v + sequence * sv3 + t * sv2 + h_idx * sv1;
+-
+-        const int64_t gb_offset = sequence * sb3 + t * sb2 + h_idx * sb1;
+-        const float * beta_t = beta + gb_offset;
+-        const float * g_t    = g    + gb_offset * (KDA ? S_v : 1);
++    auto load_qk_lane = [&] __device__(float (&reg)[d_qk_per_lane], const float * base) {
++        if constexpr (S_v < warp_size) {
++            reg[0] = lane < active_lanes ? base[lane] : 0.0f;
++        } else {
++            ggml_cuda_memcpy_1<d_qk_per_lane * sizeof(float)>(reg, base + dqk_base);
++        }
++    };
+ 
+-        const float beta_val = *beta_t;
++    auto store_qk_lane = [&] __device__(const float (&reg)[d_qk_per_lane], float * base) {
++        if constexpr (S_v < warp_size) {
++            if (lane < active_lanes) {
++                base[lane] = reg[0];
++            }
++        } else {
++            ggml_cuda_memcpy_1<d_qk_per_lane * sizeof(float)>(base + dqk_base, reg);
++        }
++    };
+ 
+-        // Cache k and q in registers
+-        float k_reg[rows_per_lane];
+-        float q_reg[rows_per_lane];
++    // State is stored transposed: M[r][c] = S[c][r].
++    __align__(16) float s_tile[GDN_DV_PER_WARP][d_qk_per_lane];
+ #pragma unroll
+-        for (int r = 0; r < rows_per_lane; r++) {
+-            const int i = r * warp_size + lane;
+-            k_reg[r] = k_t[i];
+-            q_reg[r] = q_t[i];
+-        }
++    for (int r = 0; r < GDN_DV_PER_WARP; ++r) {
++        load_qk_lane(s_tile[r], curr_state + (int64_t) (dv_base + r) * S_v);
++    }
++
++    __align__(16) float k_reg[d_qk_per_lane];
++    load_qk_lane(k_reg, k + (int64_t) iq3 * sq3 + (int64_t) iq1 * sq1);
+ 
+-        if constexpr (!KDA) {
+-            const float g_val = expf(*g_t);
++    for (int t = 0; t < n_tokens; ++t) {
++        const float * v_t = v + (int64_t) sequence * sv3 + (int64_t) t * sv2 + (int64_t) h_idx * sv1;
++        const int64_t gb_off = (int64_t) sequence * sb3 + (int64_t) t * sb2 + (int64_t) h_idx * sb1;
++        const float beta_val = beta[gb_off];
+ 
+-            // kv[col] = (S^T @ k)[col] = sum_i S[i][col] * k[i]
+-            float kv_shard = 0.0f;
++        __align__(16) float alpha_lane[d_qk_per_lane];
++        float alpha_scalar = 0.0f;
++        if constexpr (KDA) {
++            __align__(16) float g_reg[d_qk_per_lane];
++            load_qk_lane(g_reg, g + gb_off * S_v);
+ #pragma unroll
+-            for (int r = 0; r < rows_per_lane; r++) {
+-                kv_shard += s_shard[r] * k_reg[r];
++            for (int c = 0; c < d_qk_per_lane; ++c) {
++                alpha_lane[c] = expf(g_reg[c]);
+             }
+-            float kv_col = warp_reduce_sum<warp_size>(kv_shard);
++        } else {
++            alpha_scalar = expf(g[gb_off]);
++        }
+ 
+-            // delta[col] = (v[col] - g * kv[col]) * beta
+-            float delta_col = (v_t[col] - g_val * kv_col) * beta_val;
++        float v_local = 0.0f;
++        if (lane < GDN_DV_PER_WARP) {
++            v_local = v_t[dv_base + lane];
++        }
+ 
+-            // fused: S[i][col] = g * S[i][col] + k[i] * delta[col]
+-            // attn[col] = (S^T @ q)[col] = sum_i S[i][col] * q[i]
+-            float attn_partial = 0.0f;
+ #pragma unroll
+-            for (int r = 0; r < rows_per_lane; r++) {
+-                s_shard[r]  = g_val * s_shard[r] + k_reg[r] * delta_col;
+-                attn_partial += s_shard[r] * q_reg[r];
++        for (int r = 0; r < GDN_DV_PER_WARP; ++r) {
++            float partial = 0.0f;
++#pragma unroll
++            for (int c = 0; c < d_qk_per_lane; ++c) {
++                if constexpr (KDA) {
++                    partial += alpha_lane[c] * s_tile[r][c] * k_reg[c];
++                } else {
++                    partial += s_tile[r][c] * k_reg[c];
++                }
+             }
++            partial = warp_reduce_sum<warp_size>(partial);
+ 
+-            float attn_col = warp_reduce_sum<warp_size>(attn_partial);
++            const float v_r = __shfl_sync(0xffffffff, v_local, r, warp_size);
++            const float delta = beta_val * (v_r - (KDA ? 1.0f : alpha_scalar) * partial);
+ 
+-            if (lane == 0) {
+-                attn_data[col] = attn_col * scale;
+-            }
+-        } else {
+-            // kv[col] = sum_i g[i] * S[i][col] * k[i]
+-            float kv_shard = 0.0f;
+ #pragma unroll
+-            for (int r = 0; r < rows_per_lane; r++) {
+-                const int i = r * warp_size + lane;
+-                kv_shard += expf(g_t[i]) * s_shard[r] * k_reg[r];
++            for (int c = 0; c < d_qk_per_lane; ++c) {
++                if constexpr (KDA) {
++                    s_tile[r][c] = alpha_lane[c] * s_tile[r][c] + delta * k_reg[c];
++                } else {
++                    s_tile[r][c] = alpha_scalar * s_tile[r][c] + delta * k_reg[c];
++                }
+             }
++        }
+ 
+-            float kv_col = warp_reduce_sum<warp_size>(kv_shard);
++        if (t + 1 < n_tokens) {
++            load_qk_lane(k_reg, k + (int64_t) iq3 * sq3 + (int64_t) (t + 1) * sq2 + (int64_t) iq1 * sq1);
++        }
+ 
+-            // delta[col] = (v[col] - kv[col]) * beta
+-            float delta_col = (v_t[col] - kv_col) * beta_val;
++        __align__(16) float q_reg[d_qk_per_lane];
++        load_qk_lane(q_reg, q + (int64_t) iq3 * sq3 + (int64_t) t * sq2 + (int64_t) iq1 * sq1);
+ 
+-            // fused: S[i][col] = g[i] * S[i][col] + k[i] * delta[col]
+-            // attn[col] = (S^T @ q)[col] = sum_i S[i][col] * q[i]
+-            float attn_partial = 0.0f;
++        float attn_val = 0.0f;
+ #pragma unroll
+-            for (int r = 0; r < rows_per_lane; r++) {
+-                const int i = r * warp_size + lane;
+-                s_shard[r]  = expf(g_t[i]) * s_shard[r] + k_reg[r] * delta_col;
+-                attn_partial += s_shard[r] * q_reg[r];
++        for (int r = 0; r < GDN_DV_PER_WARP; ++r) {
++            float partial = 0.0f;
++#pragma unroll
++            for (int c = 0; c < d_qk_per_lane; ++c) {
++                partial += s_tile[r][c] * q_reg[c];
+             }
+-
+-            float attn_col = warp_reduce_sum<warp_size>(attn_partial);
+-
+-            if (lane == 0) {
+-                attn_data[col] = attn_col * scale;
++            partial = warp_reduce_sum<warp_size>(partial);
++            if (lane == r) {
++                attn_val = partial;
+             }
+         }
+ 
+-        attn_data += S_v * H;
++        if (lane < GDN_DV_PER_WARP) {
++            float * attn_t = attn_data + (int64_t) t * S_v * H;
++            attn_t[dv_base + lane] = attn_val * scale;
++        }
+ 
+         if constexpr (keep_rs_t) {
+             // snapshot slot mapping: slot 0 = most recent state, slot s = s tokens back.
+             // When n_tokens < K only slots 0..n_tokens-1 are written; older slots are caller-owned.
+             const int target_slot = (int) n_tokens - 1 - t;
+             if (target_slot >= 0 && target_slot < K) {
+-                float * curr_state = state + target_slot * state_slot_stride;
++                float * snapshot = state + target_slot * state_slot_stride;
+ #pragma unroll
+-                for (int r = 0; r < rows_per_lane; r++) {
+-                    const int i = r * warp_size + lane;
+-                    curr_state[col * S_v + i] = s_shard[r];
++                for (int r = 0; r < GDN_DV_PER_WARP; ++r) {
++                    store_qk_lane(s_tile[r], snapshot + (int64_t) (dv_base + r) * S_v);
+                 }
+             }
+         }
+@@ -159,9 +184,8 @@ gated_delta_net_cuda(const float * q,
+ 
+     if constexpr (!keep_rs_t) {
+ #pragma unroll
+-        for (int r = 0; r < rows_per_lane; r++) {
+-            const int i          = r * warp_size + lane;
+-            state[col * S_v + i] = s_shard[r];
++        for (int r = 0; r < GDN_DV_PER_WARP; ++r) {
++            store_qk_lane(s_tile[r], state + (int64_t) (dv_base + r) * S_v);
+         }
+     }
+ }
+@@ -179,9 +203,8 @@ static void launch_gated_delta_net(
+         float scale, int64_t state_slot_stride, int K, cudaStream_t stream) {
+     //TODO: Add chunked kernel for even faster pre-fill
+     const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
+-    const int num_warps = 4;
+-    dim3      grid_dims(H, n_seqs, (S_v + num_warps - 1) / num_warps);
+-    dim3      block_dims(warp_size <= S_v ? warp_size : S_v, num_warps, 1);
++    dim3      grid_dims(H, n_seqs, (S_v + GDN_BLOCK_DV - 1) / GDN_BLOCK_DV);
++    dim3      block_dims(warp_size, GDN_NUM_WARPS, 1);
+ 
+     const uint3 neqk1_magic = init_fastdiv_values(neqk1);
+     const uint3 rq3_magic   = init_fastdiv_values(rq3);
+@@ -267,6 +290,10 @@ static void ggml_cuda_op_gated_delta_net_impl(
+     GGML_ASSERT(ggml_is_contiguous(src_beta));
+     GGML_ASSERT(ggml_is_contiguous(src_state));
+ 
++    GGML_ASSERT(nbq1 % 16 == 0);
++    GGML_ASSERT(nbq2 % 16 == 0);
++    GGML_ASSERT(nbq3 % 16 == 0);
++
+     // strides in floats (beta strides used for both g and beta offset computation)
+     const int64_t sq1 = nbq1 / sizeof(float);
+     const int64_t sq2 = nbq2 / sizeof(float);
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 598f322..88b1d1f 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -1135,6 +1135,33 @@ static bool ggml_backend_cuda_comm_try_allreduce_internal(
+     return ggml_backend_cuda_comm_allreduce_internal(comm_ctx, tensors);
+ }
+ 
++#ifdef GGML_USE_NCCL
++static bool ggml_backend_cuda_comm_try_allreduce_hybrid(
++        ggml_backend_cuda_comm_context * comm_ctx, struct ggml_tensor ** tensors) {
++    static const int64_t internal_max_ne = [] {
++        const char * env = getenv("GGML_CUDA_ALLREDUCE_HYBRID_MAX_ELEMS");
++        if (env == nullptr) {
++            return int64_t(131072);
++        }
++
++        char * end = nullptr;
++        const int64_t value = strtoll(env, &end, 10);
++        if (end == env || *end != '\0' || value < 0) {
++            GGML_LOG_WARN("invalid GGML_CUDA_ALLREDUCE_HYBRID_MAX_ELEMS value: %s, using 131072\n", env);
++            return int64_t(131072);
++        }
++        return value;
++    }();
++
++    if (ggml_nelements(tensors[0]) <= internal_max_ne &&
++        ggml_backend_cuda_comm_allreduce_internal(comm_ctx, tensors)) {
++        return true;
++    }
++
++    return ggml_backend_cuda_comm_allreduce_nccl(comm_ctx, tensors);
++}
++#endif // GGML_USE_NCCL
++
+ static bool ggml_backend_cuda_comm_try_allreduce_butterfly(
+         ggml_backend_cuda_comm_context *, struct ggml_tensor **) {
+     return false;
+@@ -1169,6 +1196,37 @@ static void ggml_backend_cuda_comm_init_internal(ggml_backend_cuda_comm_context
+     ggml_backend_cuda_comm_init_none(ret);
+ }
+ 
++#ifdef GGML_USE_NCCL
++static void ggml_backend_cuda_comm_init_hybrid(ggml_backend_cuda_comm_context * ret) {
++    const ggml_cuda_device_info & info = ggml_cuda_info();
++    if (info.device_count > info.physical_device_count) {
++        GGML_LOG_WARN("hybrid AllReduce disabled: virtual devices in use; falling back to internal AllReduce\n");
++        ggml_backend_cuda_comm_init_internal(ret);
++        return;
++    }
++
++    const size_t n = ret->dev_ids.size();
++    ret->comms.resize(n);
++    const ncclResult_t rc = ncclCommInitAll(ret->comms.data(), (int) n, ret->dev_ids.data());
++    if (rc != ncclSuccess) {
++        ret->comms.clear();
++        GGML_LOG_WARN("hybrid NCCL init failed (%s); falling back to internal AllReduce\n", ncclGetErrorString(rc));
++        ggml_backend_cuda_comm_init_internal(ret);
++        return;
++    }
++
++    ret->ar_pipeline = ggml_cuda_ar_pipeline_init(ret->dev_ids.data(), ret->dev_ids.size());
++    if (ret->ar_pipeline == nullptr) {
++        (void) cudaGetLastError();
++        GGML_LOG_WARN("hybrid internal AllReduce init failed; using NCCL only\n");
++        ret->try_allreduce = ggml_backend_cuda_comm_try_allreduce_nccl;
++        return;
++    }
++
++    ret->try_allreduce = ggml_backend_cuda_comm_try_allreduce_hybrid;
++}
++#endif // GGML_USE_NCCL
++
+ static void ggml_backend_cuda_comm_init_nccl(ggml_backend_cuda_comm_context * ret) {
+ #ifdef GGML_USE_NCCL
+     // Disabling NCCL path when CUDA virtual devices are in use since NCCL requires one distinct physical GPU per rank.
+@@ -1233,6 +1291,10 @@ static void * ggml_backend_cuda_comm_init(ggml_backend_t * backends, size_t n_ba
+             ggml_backend_cuda_comm_init_nccl(ret);
+         } else if (env_str == "internal") {
+             ggml_backend_cuda_comm_init_internal(ret);
++#ifdef GGML_USE_NCCL
++        } else if (env_str == "hybrid") {
++            ggml_backend_cuda_comm_init_hybrid(ret);
++#endif // GGML_USE_NCCL
+         } else if (env_str == "none") {
+             ggml_backend_cuda_comm_init_none(ret);
+         } else {
+@@ -1767,7 +1829,7 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_f(const ggml_tensor * tensor) {
+     const int cc      = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+     use_mul_mat_vec_f = use_mul_mat_vec_f && ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, is_mul_mat_id ? src1->ne[2] : src1->ne[1]);
+ 
+-    //we only support fusion for ncols_dst = 1
++    // we only support fusion for ncols_dst = 1
+     if (tensor->op == GGML_OP_MUL_MAT && dst->ne[1] != 1) {
+         return false;
+     }
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index 0589e65..1255a6b 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -457,6 +457,16 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
+     return 1;
+ }
+ 
++static constexpr __host__ __device__ int calc_min_blocks_per_sm(
++        ggml_type type, int ncols_dst, mmvq_parameter_table_id table_id) {
++    // The Volta-targeted build maps sm_70 to the generic table.  Q8_0 x 4
++    // naturally compiles to 72 registers/thread, which limits a V100 SM to
++    // seven 128-thread blocks.  Requesting eight blocks caps it at 64
++    // registers and exposes one more resident block for the dominant MTP
++    // verification kernel.
++    return table_id == MMVQ_PARAMETERS_GENERIC && type == GGML_TYPE_Q8_0 && ncols_dst == 4 ? 8 : 1;
++}
++
+ static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int table_id, bool small_k = false, int nwarps = 1) {
+     if (table_id == MMVQ_PARAMETERS_GENERIC || table_id == MMVQ_PARAMETERS_GCN || table_id == MMVQ_PARAMETERS_TURING) {
+         switch (ncols_dst) {
+@@ -478,7 +488,9 @@ static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int
+ }
+ 
+ template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false>
+-__launch_bounds__(calc_nwarps(type, ncols_dst, get_device_table_id())*ggml_cuda_get_physical_warp_size(), 1)
++__launch_bounds__(
++    calc_nwarps(type, ncols_dst, get_device_table_id())*ggml_cuda_get_physical_warp_size(),
++    calc_min_blocks_per_sm(type, ncols_dst, get_device_table_id()))
+ static __global__ void mul_mat_vec_q(
+         const void * vx_ptr, const void * vy_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion, float * dst_ptr,
+         const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t stride_row_x, const uint32_t stride_col_y,
+diff --git a/include/llama.h b/include/llama.h
+index 177fc10..6b4af43 100644
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -262,6 +262,12 @@ extern "C" {
+         int32_t      *  n_seq_id;
+         llama_seq_id ** seq_id;
+         int8_t       *  logits;   // TODO: rename this to "output"
++
++        // Optional auxiliary hidden-state rows for decoder heads which need both
++        // an input embedding and a hidden state for every position (for example
++        // multimodal MTP). When NULL, legacy heads may continue to use embd for
++        // their hidden-state input. [EXPERIMENTAL]
++        float        *  embd_h;
+     } llama_batch;
+ 
+     enum llama_model_kv_override_type {
+diff --git a/src/llama-batch.cpp b/src/llama-batch.cpp
+index 2b98a55..fde76b5 100644
+--- a/src/llama-batch.cpp
++++ b/src/llama-batch.cpp
+@@ -225,6 +225,7 @@ bool llama_batch_allocr::init(
+             /*.seq_idx      =*/ this->seq_idx.data(),
+             /*.output       =*/ batch.logits,
+             /*.data         =*/ {},
++            /*.embd_h       =*/ batch.embd_h,
+         };
+ 
+         ubatch_print(ubatch, debug);
+@@ -402,6 +403,7 @@ llama_ubatch llama_batch_allocr::ubatch_reserve(uint32_t n_seq_tokens, uint32_t
+ 
+     udata->token     .resize(n_tokens);
+     udata->embd      .clear();
++    udata->embd_h    .clear();
+     udata->pos       .resize(n_pos_all);
+     udata->n_seq_id  .resize(n_tokens);
+     udata->seq_id    .resize(n_tokens);
+@@ -431,6 +433,7 @@ llama_ubatch llama_batch_allocr::ubatch_reserve(uint32_t n_seq_tokens, uint32_t
+         /*.seq_idx      =*/ udata->seq_idx.data(),
+         /*.output       =*/ udata->output.data(),
+         /*.data         =*/ std::move(udata),
++        /*.embd_h       =*/ nullptr,
+     };
+ 
+     return res;
+@@ -753,11 +756,13 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
+ 
+     auto udata = std::make_shared<llama_ubatch::data_t>();
+ 
+-    const int64_t n_embd_all = batch.embd ? (int64_t) n_tokens*n_embd : 0;
++    const int64_t n_embd_all   = batch.embd   ? (int64_t) n_tokens*n_embd : 0;
++    const int64_t n_embd_h_all = batch.embd_h ? (int64_t) n_tokens*n_embd : 0;
+     const int64_t n_pos_all  =              (int64_t) n_tokens*n_pos_per_embd;
+ 
+     udata->token     .resize(n_tokens);
+     udata->embd      .resize(n_embd_all);
++    udata->embd_h    .resize(n_embd_h_all);
+     udata->pos       .resize(n_pos_all);
+     udata->n_seq_id  .resize(n_tokens);
+     udata->seq_id    .resize(n_tokens);
+@@ -778,6 +783,10 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
+             memcpy(udata->embd.data() + i*n_embd, batch.embd + (int64_t) idxs[i]*n_embd, n_embd*sizeof(float));
+         }
+ 
++        if (batch.embd_h) {
++            memcpy(udata->embd_h.data() + i*n_embd, batch.embd_h + (int64_t) idxs[i]*n_embd, n_embd*sizeof(float));
++        }
++
+         for (size_t j = 0; j < (size_t)n_pos_per_embd; ++j) {
+             // if we are using M-RoPE
+             //     if the current batch is text, we need to broadcast the same position across all RoPE sections
+@@ -815,6 +824,8 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
+         }
+     }
+ 
++    float * embd_h_data = batch.embd_h ? udata->embd_h.data() : nullptr;
++
+     llama_ubatch res {
+         /*.b_equal_seqs =*/ equal_seqs,
+         /*.n_tokens     =*/ n_tokens,
+@@ -832,6 +843,7 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
+         /*.seq_idx      =*/ udata->seq_idx.data(),
+         /*.output       =*/ udata->output.data(),
+         /*.data         =*/ std::move(udata),
++        /*.embd_h       =*/ embd_h_data,
+     };
+ 
+     if (debug > 0) {
+diff --git a/src/llama-batch.h b/src/llama-batch.h
+index a3d1889..b20613e 100644
+--- a/src/llama-batch.h
++++ b/src/llama-batch.h
+@@ -54,6 +54,7 @@ struct llama_ubatch {
+     struct data_t {
+         std::vector<llama_token>    token;
+         std::vector<float>          embd;
++        std::vector<float>          embd_h;
+         std::vector<llama_pos>      pos;
+         std::vector<int32_t>        n_seq_id;
+         std::vector<llama_seq_id *> seq_id;      // these point into the seq_id_data below
+@@ -66,6 +67,10 @@ struct llama_ubatch {
+ 
+     // the llama_ubatch pointers above point to this data if set. otherwise - point to external non-owning data
+     std::shared_ptr<data_t> data;
++
++    // Optional hidden-state rows paired with token/embedding input. Kept after
++    // data so existing aggregate initializers remain source-compatible.
++    float * embd_h;
+ };
+ 
+ // a helper for sanitizing, fulfilling and splitting a batch
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 792bb6c..3e1d6b1 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -15,6 +15,7 @@
+ 
+ #include <cinttypes>
+ #include <cmath>
++#include <cstdlib>
+ #include <cstring>
+ #include <limits>
+ #include <stdexcept>
+@@ -736,6 +737,16 @@ void llama_context::synchronize() {
+     t_compute_start_us = 0;
+ }
+ 
++void llama_context::synchronize_outputs() {
++    // A sampler commonly queries several rows/counts/candidate arrays from
++    // the same completed decode.  The first query must wait for the backend;
++    // after synchronize() clears n_queued_tokens the remaining output views
++    // are already host-visible and another device-wide wait is redundant.
++    if (n_queued_tokens > 0) {
++        synchronize();
++    }
++}
++
+ const llama_model & llama_context::get_model() const {
+     return model;
+ }
+@@ -1042,7 +1053,32 @@ const llama_token * llama_context::get_sampled_candidates_ith(int32_t idx) {
+         if (sampling.candidates.has_data() &&
+             (size_t) row < sampling.candidates_count.size() &&
+             sampling.candidates_count[row] > 0) {
+-            return sampling.candidates.data + row*model.vocab.n_tokens();
++            llama_token * candidates = sampling.candidates.data + row*model.vocab.n_tokens();
++
++            // LLAMA_EXPERIMENTAL_TP_LOCAL_TOPK returns two concatenated local
++            // top-k lists.  Device 1 indices are relative to the second half
++            // of the vocabulary; convert them to global token ids lazily,
++            // after llama_synchronize() made the async D2H copies visible.
++            // The range test makes the adjustment idempotent when callers ask
++            // for the candidate view more than once.
++            const char * tp_local_topk_env = std::getenv("LLAMA_EXPERIMENTAL_TP_LOCAL_TOPK");
++            const bool tp_local_topk = tp_local_topk_env &&
++                std::strcmp(tp_local_topk_env, "0") != 0 &&
++                std::strcmp(tp_local_topk_env, "false") != 0 &&
++                std::strcmp(tp_local_topk_env, "off") != 0;
++            const char * output_dev_name = model.dev_output() ? ggml_backend_dev_name(model.dev_output()) : "";
++            const bool tp_output = std::strncmp(output_dev_name, "Meta(", 5) == 0;
++            const uint32_t count = sampling.candidates_count[row];
++            const llama_token vocab_split = model.vocab.n_tokens()/2;
++            if (tp_local_topk && tp_output && count > 0 && count % 2 == 0 && model.vocab.n_tokens() % 2 == 0) {
++                for (uint32_t i = count/2; i < count; ++i) {
++                    if (candidates[i] >= 0 && candidates[i] < vocab_split) {
++                        candidates[i] += vocab_split;
++                    }
++                }
++            }
++
++            return candidates;
+         }
+     } catch (const std::exception & err) {
+         // fallback to full vocab list
+@@ -1213,7 +1249,44 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
+ 
+     LLAMA_LOG_DEBUG("%s: seq_id = %d, sampler = %p\n", __func__, (int) seq_id, (void *) sampler);
+ 
+-    if (sampler && model.split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
++    const char * tp_backend_sampling_env = std::getenv("LLAMA_EXPERIMENTAL_TP_BACKEND_SAMPLING");
++    const bool tp_backend_sampling = tp_backend_sampling_env &&
++        std::strcmp(tp_backend_sampling_env, "0") != 0 &&
++        std::strcmp(tp_backend_sampling_env, "false") != 0 &&
++        std::strcmp(tp_backend_sampling_env, "off") != 0;
++
++    const char * tp_local_topk_env = std::getenv("LLAMA_EXPERIMENTAL_TP_LOCAL_TOPK");
++    const bool tp_local_topk = tp_local_topk_env &&
++        std::strcmp(tp_local_topk_env, "0") != 0 &&
++        std::strcmp(tp_local_topk_env, "false") != 0 &&
++        std::strcmp(tp_local_topk_env, "off") != 0;
++
++    if (sampler && model.split_mode() == LLAMA_SPLIT_MODE_TENSOR &&
++            tp_backend_sampling && tp_local_topk) {
++        const float * split = model.tensor_split();
++        const bool split_default = split == nullptr || (split[0] == 0.0f && split[1] == 0.0f);
++        const bool split_equal = split_default ||
++            std::fabs(split[0] - split[1]) <= 1.0e-6f * std::max(std::fabs(split[0]), std::fabs(split[1]));
++        const bool supported =
++            model.get_split_state_ud.n_devices == 2 &&
++            model.vocab.n_tokens() % 2 == 0 &&
++            split_equal;
++
++        if (!supported) {
++            static bool warned_local_topk = false;
++            if (!warned_local_topk) {
++                LLAMA_LOG_WARN("%s: TP local top-k requires two equal vocabulary shards; using CPU sampling\n", __func__);
++                warned_local_topk = true;
++            }
++            if (sampling.samplers.count(seq_id) > 0) {
++                sched_need_reserve = true;
++            }
++            sampling.samplers.erase(seq_id);
++            return false;
++        }
++    }
++
++    if (sampler && model.split_mode() == LLAMA_SPLIT_MODE_TENSOR && !tp_backend_sampling) {
+         static bool warned = false;
+         if (!warned) {
+             LLAMA_LOG_WARN("%s: backend sampling not supported with SPLIT_MODE_TENSOR; using CPU\n", __func__);
+@@ -1226,6 +1299,14 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
+         return false;
+     }
+ 
++    if (sampler && model.split_mode() == LLAMA_SPLIT_MODE_TENSOR && tp_backend_sampling) {
++        static bool warned_experimental = false;
++        if (!warned_experimental) {
++            LLAMA_LOG_WARN("%s: enabling experimental backend sampling on the tensor-parallel Meta device\n", __func__);
++            warned_experimental = true;
++        }
++    }
++
+     const bool can_offload =
+         sampler &&
+         sampler->iface->backend_init &&
+@@ -1967,6 +2048,11 @@ int llama_context::decode(const llama_batch & batch_inp) {
+ 
+         n_outputs_prev += n_outputs;
+         n_tokens_prev  += ubatch.n_tokens;
++
++        if (cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP && n_tokens_prev < n_tokens_all) {
++            synchronize();
++        }
++
+     } while (mctx->next());
+ 
+     // set to total number of outputs in the batch, for use in llama_get_logits_ith
+@@ -3736,13 +3822,13 @@ void llama_synchronize(llama_context * ctx) {
+ }
+ 
+ float * llama_get_logits(llama_context * ctx) {
+-    ctx->synchronize();
++    ctx->synchronize_outputs();
+ 
+     return ctx->get_logits();
+ }
+ 
+ float * llama_get_logits_ith(llama_context * ctx, int32_t i) {
+-    ctx->synchronize();
++    ctx->synchronize_outputs();
+ 
+     float * res = nullptr;
+ 
+@@ -3756,19 +3842,19 @@ float * llama_get_logits_ith(llama_context * ctx, int32_t i) {
+ }
+ 
+ float * llama_get_embeddings(llama_context * ctx) {
+-    ctx->synchronize();
++    ctx->synchronize_outputs();
+ 
+     return ctx->get_embeddings();
+ }
+ 
+ float * llama_get_embeddings_ith(llama_context * ctx, int32_t i) {
+-    ctx->synchronize();
++    ctx->synchronize_outputs();
+ 
+     return ctx->get_embeddings_ith(i);
+ }
+ 
+ float * llama_get_embeddings_seq(llama_context * ctx, llama_seq_id seq_id) {
+-    ctx->synchronize();
++    ctx->synchronize_outputs();
+ 
+     return ctx->get_embeddings_seq(seq_id);
+ }
+@@ -3794,19 +3880,19 @@ llama_memory_t llama_get_memory(const struct llama_context * ctx) {
+ }
+ 
+ float * llama_get_embeddings_nextn(llama_context * ctx) {
+-    ctx->synchronize();
++    ctx->synchronize_outputs();
+ 
+     return ctx->get_embeddings_nextn();
+ }
+ 
+ float * llama_get_embeddings_nextn_ith(llama_context * ctx, int32_t i) {
+-    ctx->synchronize();
++    ctx->synchronize_outputs();
+ 
+     return ctx->get_embeddings_nextn_ith(i);
+ }
+ 
+ float * llama_get_embeddings_layer_inp(llama_context * ctx, uint32_t lid) {
+-    ctx->synchronize();
++    ctx->synchronize_outputs();
+ 
+     return ctx->get_embeddings_layer_inp(lid);
+ }
+@@ -3816,43 +3902,43 @@ bool llama_set_sampler(llama_context * ctx, llama_seq_id seq_id, llama_sampler *
+ }
+ 
+ llama_token llama_get_sampled_token_ith(llama_context * ctx, int32_t i) {
+-    ctx->synchronize();
++    ctx->synchronize_outputs();
+ 
+     return ctx->get_sampled_token_ith(i);
+ }
+ 
+ float * llama_get_sampled_probs_ith(llama_context * ctx, int32_t i) {
+-    ctx->synchronize();
++    ctx->synchronize_outputs();
+ 
+     return ctx->get_sampled_probs_ith(i);
+ }
+ 
+ float * llama_get_sampled_logits_ith(llama_context * ctx, int32_t i) {
+-    ctx->synchronize();
++    ctx->synchronize_outputs();
+ 
+     return ctx->get_sampled_logits_ith(i);
+ }
+ 
+ llama_token * llama_get_sampled_candidates_ith(llama_context * ctx, int32_t i) {
+-    ctx->synchronize();
++    ctx->synchronize_outputs();
+ 
+     return const_cast<llama_token *>(ctx->get_sampled_candidates_ith(i));
+ }
+ 
+ uint32_t llama_get_sampled_candidates_count_ith(llama_context * ctx, int32_t i) {
+-    ctx->synchronize();
++    ctx->synchronize_outputs();
+ 
+     return static_cast<uint32_t>(ctx->get_sampled_candidates_count(i));
+ }
+ 
+ uint32_t llama_get_sampled_logits_count_ith(llama_context * ctx, int32_t i) {
+-    ctx->synchronize();
++    ctx->synchronize_outputs();
+ 
+     return static_cast<uint32_t>(ctx->get_sampled_logits_count(i));
+ }
+ 
+ uint32_t llama_get_sampled_probs_count_ith(llama_context * ctx, int32_t i) {
+-    ctx->synchronize();
++    ctx->synchronize_outputs();
+ 
+     return static_cast<uint32_t>(ctx->get_sampled_probs_count(i));
+ }
+diff --git a/src/llama-context.h b/src/llama-context.h
+index bf91daa..3422717 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -56,6 +56,7 @@ struct llama_context {
+     void sched_reserve();
+ 
+     void synchronize();
++    void synchronize_outputs();
+ 
+     const llama_model   & get_model()   const;
+     const llama_cparams & get_cparams() const;
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 1896758..a49802b 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -103,13 +103,11 @@ void llm_graph_input_embd_h::set_input(const llama_ubatch * ubatch) {
+         ggml_backend_tensor_set(embd, ubatch->embd, 0, n_tokens*n_embd*ggml_element_size(h));
+     }
+ 
+-    // TODO: extend llama_ubatch to differentiate between token embeddings and hidden states
+-    //       for now, we assume that the hidden state is always provided as an embedding
+-    //       ref: https://github.com/ggml-org/llama.cpp/pull/23643
+-    if (ubatch->embd) {
++    const float * h_data = ubatch->embd_h ? ubatch->embd_h : ubatch->embd;
++    if (h_data) {
+         GGML_ASSERT(n_embd == h->ne[0]);
+ 
+-        ggml_backend_tensor_set(h, ubatch->embd, 0, n_tokens*n_embd*ggml_element_size(h));
++        ggml_backend_tensor_set(h, h_data, 0, n_tokens*n_embd*ggml_element_size(h));
+     }
+ }
+ 
+@@ -118,7 +116,8 @@ bool llm_graph_input_embd_h::can_reuse(const llm_graph_params & params) {
+ 
+     res &= (!params.ubatch.token) || (tokens && tokens->ne[0] == params.ubatch.n_tokens);
+     res &= (!params.ubatch.embd)  || (embd   && embd->ne[1]   == params.ubatch.n_tokens);
+-    res &= (!params.ubatch.embd)  || (h      && h->ne[1]      == params.ubatch.n_tokens);
++    res &= (!(params.ubatch.embd_h || params.ubatch.embd)) ||
++           (h && h->ne[1] == params.ubatch.n_tokens);
+ 
+     return res;
+ }
+diff --git a/src/llama-kv-cache-dsv4.cpp b/src/llama-kv-cache-dsv4.cpp
+index 5caa05e..acb61cc 100644
+--- a/src/llama-kv-cache-dsv4.cpp
++++ b/src/llama-kv-cache-dsv4.cpp
+@@ -165,6 +165,7 @@ static llama_ubatch dsv4_build_raw_write_ubatch(const llama_ubatch & ubatch) {
+         /*.seq_idx      =*/ data->seq_idx.data(),
+         /*.output       =*/ data->output.data(),
+         /*.data         =*/ data,
++        /*.embd_h       =*/ nullptr,
+     };
+ 
+     return res;
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index 25df273..57aa44a 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -27,6 +27,7 @@
+ #include <cassert>
+ #include <cfloat>
+ #include <cstdint>
++#include <cstdlib>
+ #include <cstring>
+ #include <cmath>
+ #include <functional>
+@@ -446,6 +447,32 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
+     };
+ 
+     auto get_tensor_config = [&]() -> tensor_config {
++        // The final Qwen3.5 block is the single MTP prediction head and is
++        // never used by the target context.  On two PCIe GPUs, duplicating
++        // this comparatively small block avoids a tensor-parallel reduction
++        // and an extra pair of CUDA graph launches on every drafted token;
++        // the much larger vocabulary projection remains axis-1 sharded.
++        // Mirror its KV state as well so every rank owns a self-contained
++        // copy of the head.  Keep this opt-in for strict A/B testing.
++        const char * mirror_mtp_env = std::getenv("LLAMA_EXPERIMENTAL_MTP_MIRROR_LAYER");
++        const bool mirror_mtp = mirror_mtp_env &&
++            std::strcmp(mirror_mtp_env, "0") != 0 &&
++            std::strcmp(mirror_mtp_env, "false") != 0 &&
++            std::strcmp(mirror_mtp_env, "off") != 0;
++        if (mirror_mtp) {
++            const std::string mtp_layer = std::to_string(hparams.n_layer());
++            const std::string mtp_prefix = "blk." + mtp_layer + ".";
++            const bool is_mtp_weight = tensor_name.rfind(mtp_prefix, 0) == 0;
++            const bool is_mtp_cache =
++                tensor_name == "cache_k_l" + mtp_layer ||
++                tensor_name == "cache_v_l" + mtp_layer ||
++                tensor_name == "cache_r_l" + mtp_layer ||
++                tensor_name == "cache_s_l" + mtp_layer;
++            if (is_mtp_weight || is_mtp_cache) {
++                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
++            }
++        }
++
+         // standard attention
+         if (std::regex_match(tensor_name, pattern_q_weight) || std::regex_match(tensor_name, pattern_kv_weight)) {
+             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "attn_output.weight", "ssm_out.weight");
+diff --git a/src/llama-sampler.cpp b/src/llama-sampler.cpp
+index 34a7988..02dfd05 100644
+--- a/src/llama-sampler.cpp
++++ b/src/llama-sampler.cpp
+@@ -662,6 +662,14 @@ static bool llama_sampler_backend_support(
+ 
+ // sampler chain
+ 
++static bool llama_sampler_tp_local_topk_enabled() {
++    const char * value = std::getenv("LLAMA_EXPERIMENTAL_TP_LOCAL_TOPK");
++    return value &&
++        std::strcmp(value, "0") != 0 &&
++        std::strcmp(value, "false") != 0 &&
++        std::strcmp(value, "off") != 0;
++}
++
+ static const char * llama_sampler_chain_name(const struct llama_sampler * /*smpl*/) {
+     return "chain";
+ }
+@@ -740,6 +748,51 @@ static bool llama_sampler_chain_backend_init(
+ 
+     chain->is_init = true;
+ 
++    // A tensor-parallel vocabulary cannot run global per-row samplers on each
++    // shard independently. Only disabled ("?...") no-op samplers may precede
++    // the first active top-k. Any active sampler before top-k forces a full-
++    // logits CPU fallback: even backend-capable filters can change rankings or
++    // depend on global normalization, and global token ids are not shard-local.
++    if (llama_sampler_tp_local_topk_enabled()) {
++        bool found_top_k = false;
++        bool prefix_ok = true;
++        for (auto & entry : chain->samplers) {
++            entry.is_backend = false;
++            if (!prefix_ok || found_top_k) {
++                continue;
++            }
++
++            // Only the built-in empty sampler is guaranteed to be a no-op.
++            // Do not infer that from a leading '?' in a custom sampler name:
++            // an active custom sampler there would make shard-local top-k
++            // distribution-changing and must force the full-logits fallback.
++            if (entry.ptr->iface == &llama_sampler_empty_i) {
++                entry.is_backend = true;
++                continue;
++            }
++
++            const char * name = entry.ptr->iface->name(entry.ptr);
++            const bool is_top_k = std::strcmp(name, "top-k") == 0;
++            if (!is_top_k) {
++                prefix_ok = false;
++                continue;
++            }
++
++            if (!entry.ptr->iface->backend_init ||
++                    !entry.ptr->iface->backend_init(entry.ptr, buft, n_outputs_max_per_seq)) {
++                prefix_ok = false;
++                continue;
++            }
++
++            entry.is_backend = true;
++            found_top_k = is_top_k;
++        }
++
++        auto probe = llama_sampler_backend_probe_graph(smpl, 1024*1024, GGML_DEFAULT_GRAPH_SIZE, false);
++        chain->n_nodes = llama_sampler_backend_probe_n_nodes(probe);
++        return found_top_k;
++    }
++
+     bool res = true;
+     bool backend_prefix = true;
+ 
+@@ -797,6 +850,18 @@ static void llama_sampler_chain_backend_apply(
+ 
+     GGML_ASSERT(chain->is_init && "llama_sampler_chain_backend_init() not called");
+ 
++    if (llama_sampler_tp_local_topk_enabled()) {
++        for (auto & entry : chain->samplers) {
++            if (!entry.is_backend) {
++                break;
++            }
++            if (entry.ptr->iface->backend_apply) {
++                entry.ptr->iface->backend_apply(entry.ptr, ctx, gf, data);
++            }
++        }
++        return;
++    }
++
+     for (auto & smpl : chain->samplers) {
+         if (!smpl.is_backend) {
+             break;
+@@ -1241,7 +1306,9 @@ static struct llama_sampler * llama_sampler_dist_clone(const struct llama_sample
+ 
+         result_ctx->seed_cur                  = ctx->seed_cur;
+         result_ctx->rng                       = ctx->rng;
+-        result_ctx->backend_transactional     = ctx->backend_transactional;
++        // A clone is not attached to the source sampling graph. Keep its CPU
++        // RNG state, but do not inherit graph-owned transactional behavior.
++        result_ctx->backend_transactional     = false;
+         result_ctx->rng_backend               = ctx->rng_backend;
+         result_ctx->n_backend_draws_generated = ctx->n_backend_draws_generated;
+         result_ctx->n_backend_draws_committed = ctx->n_backend_draws_committed;
+@@ -1467,7 +1534,10 @@ static bool llama_sampler_top_k_backend_init(
+     auto * sctx = (llama_sampler_top_k *) smpl->ctx;
+     GGML_UNUSED(n_outputs_max_per_seq);
+ 
+-    const bool res = llama_sampler_backend_support(smpl, buft);
++    bool res = llama_sampler_backend_support(smpl, buft);
++    if (llama_sampler_tp_local_topk_enabled() && (sctx->k <= 0 || sctx->k > 256)) {
++        res = false;
++    }
+ 
+     sctx->init(res);
+ 
+@@ -1483,7 +1553,37 @@ static void llama_sampler_top_k_backend_apply(
+ 
+     struct ggml_tensor * logits = ggml_reshape_1d(ctx, data->logits, ggml_nelements(data->logits));
+ 
+-    struct ggml_tensor * top_k = ggml_top_k(ctx, logits, sctx->k);
++    // With tensor-parallel output weights the vocabulary/logits tensor is
++    // sharded along axis 0.  The Meta backend can execute an independent
++    // local top-k on each shard and concatenate the tiny candidate lists for
++    // the CPU sampler to merge.  Request a tunable number of candidates per
++    // shard by making the logical result 2*k_local wide (the V100-X1 target
++    // is fixed to two devices).  Greedy decoding only needs one per shard.
++    // This avoids copying the complete ~152k-token logits vector after every
++    // MTP draft step.
++    const char * tp_local_topk_env = std::getenv("LLAMA_EXPERIMENTAL_TP_LOCAL_TOPK");
++    const bool tp_local_topk = tp_local_topk_env &&
++        std::strcmp(tp_local_topk_env, "0") != 0 &&
++        std::strcmp(tp_local_topk_env, "false") != 0 &&
++        std::strcmp(tp_local_topk_env, "off") != 0;
++    int32_t k_local = 1;
++    if (const char * value = std::getenv("LLAMA_EXPERIMENTAL_TP_LOCAL_TOPK_K")) {
++        char * end = nullptr;
++        const long parsed = std::strtol(value, &end, 10);
++        if (end != value && parsed > 0) {
++            k_local = (int32_t) std::min<long>(parsed, 256);
++        }
++    }
++    // Returning at least k candidates from every shard is sufficient to
++    // reconstruct the exact global top-k after concatenation.
++    if (sctx->k > 0) {
++        k_local = std::max(k_local, std::min(sctx->k, 256));
++    }
++    const int32_t k_backend = tp_local_topk
++        ? (int32_t) std::min<int64_t>(2*k_local, ggml_nelements(logits))
++        : sctx->k;
++
++    struct ggml_tensor * top_k = ggml_top_k(ctx, logits, k_backend);
+     ggml_set_name(top_k, "top_k");
+ 
+     if (data->candidates) {
+@@ -1617,6 +1717,11 @@ static bool llama_sampler_top_p_backend_init(
+     auto * sctx = (llama_sampler_top_p *) smpl->ctx;
+     GGML_UNUSED(n_outputs_max_per_seq);
+ 
++    // In the experimental tensor-parallel local-top-k path the preceding
++    // top-k has reduced each vocabulary shard to a tiny candidate list, but
++    // probability mass must be normalized across the union of both shards.
++    // Stop the backend prefix here so the existing CPU chain merges the 40
++    // candidates exactly instead of attempting an invalid per-shard top-p.
+     const bool res = llama_sampler_backend_support(smpl, buft);
+ 
+     sctx->init(res);
+@@ -2738,6 +2843,25 @@ static struct llama_sampler * llama_sampler_grammar_clone(const struct llama_sam
+     return result;
+ }
+ 
++static void llama_sampler_grammar_copy_state(const struct llama_sampler * src, struct llama_sampler * dst) {
++    const auto * src_ctx = (const llama_sampler_grammar *) src->ctx;
++    auto * dst_ctx = (llama_sampler_grammar *) dst->ctx;
++
++    // Build the replacement before releasing dst's state. Besides preserving
++    // correctness for the rule-stack pointers, this avoids the temporary
++    // sampler/context allocation used by llama_sampler_copy()'s fallback.
++    auto grammar_str = src_ctx->grammar_str;
++    auto grammar_root = src_ctx->grammar_root;
++    auto * grammar = src_ctx->grammar ? llama_grammar_clone_impl(*src_ctx->grammar) : nullptr;
++
++    llama_grammar_free_impl(dst_ctx->grammar);
++
++    dst_ctx->vocab        = src_ctx->vocab;
++    dst_ctx->grammar_str  = std::move(grammar_str);
++    dst_ctx->grammar_root = std::move(grammar_root);
++    dst_ctx->grammar      = grammar;
++}
++
+ static void llama_sampler_grammar_free(struct llama_sampler * smpl) {
+     const auto * ctx = (llama_sampler_grammar *) smpl->ctx;
+ 
+@@ -2760,7 +2884,7 @@ static struct llama_sampler_i llama_sampler_grammar_i = {
+     /* .backend_apply     = */ nullptr,
+     /* .backend_set_input = */ nullptr,
+     /* .backend_reset     = */ nullptr,
+-    /* .copy_state        = */ nullptr,
++    /* .copy_state        = */ llama_sampler_grammar_copy_state,
+ };
+ 
+ static struct llama_sampler * llama_sampler_init_grammar_impl(
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+index 08c6f5a..dda92f1 100644
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -195,6 +195,12 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
+     # llama_build_and_test(test-double-float.cpp) # SLOW
+ 
+     llama_build_and_test(test-llama-archs.cpp)
++    llama_test(
++        test-llama-archs
++        NAME test-mtp-ubatch-sync
++        LABEL main
++        ARGS --test-mtp-ubatch-sync
++    )
+ 
+     set(MODEL_DIR "${CMAKE_CURRENT_BINARY_DIR}/test-models/")
+     file(MAKE_DIRECTORY "${MODEL_DIR}")
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 3349a64..51e48ec 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -8758,6 +8758,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     test_cases.emplace_back(new test_argmax(GGML_TYPE_F32, {1024, 12, 1, 1}));
+     test_cases.emplace_back(new test_argmax(GGML_TYPE_F32, {2000, 10, 1, 1}));
+     test_cases.emplace_back(new test_argmax(GGML_TYPE_F32, {5438,  3, 1, 1}));
++    test_cases.emplace_back(new test_argmax(GGML_TYPE_F32, {129023, 3, 1, 1}));
++    test_cases.emplace_back(new test_argmax(GGML_TYPE_F32, {151936, 1, 1, 1}));
++    test_cases.emplace_back(new test_argmax(GGML_TYPE_F32, {151936, 8, 1, 1}));
+ 
+     for (int ne3 : {1, 3}) { // CUDA backward pass only supports ne3 == 1
+         test_cases.emplace_back(new test_repeat(GGML_TYPE_F32, {10, 5, 4, ne3}, {1, 1, 1, 1}));
+diff --git a/tests/test-llama-archs.cpp b/tests/test-llama-archs.cpp
+index 9105c18..3db3475 100644
+--- a/tests/test-llama-archs.cpp
++++ b/tests/test-llama-archs.cpp
+@@ -65,7 +65,7 @@ static void set_tensor_data(struct ggml_tensor * tensor, void * userdata) {
+ }
+ 
+ static void usage(char ** argv) {
+-    printf("Usage: %s [-a/--arch arch] [-s/--seed seed] [-v/--verbose]\n", argv[0]);
++    printf("Usage: %s [-a/--arch arch] [-s/--seed seed] [-v/--verbose] [--test-mtp-ubatch-sync]\n", argv[0]);
+ }
+ 
+ static std::vector<llama_token> get_tokens(const uint32_t n_tokens, const uint32_t n_vocab, const size_t seed){
+@@ -79,10 +79,10 @@ static std::vector<llama_token> get_tokens(const uint32_t n_tokens, const uint32
+     return ret;
+ }
+ 
+-static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
++static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const bool mtp = false) {
+     gguf_context_ptr ret(gguf_init_empty());
+     llama_model_saver ms(arch, ret.get());
+-    const uint32_t n_ctx = 128;
++    const uint32_t n_ctx = mtp ? 256 : 128;
+ 
+     uint32_t n_vocab = 128;
+     uint32_t n_embd  = 256;
+@@ -127,6 +127,9 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
+     ms.add_kv(LLM_KV_FEATURES_LENGTH,           n_embd);
+     ms.add_kv(LLM_KV_BLOCK_COUNT,               n_layer);
+     ms.add_kv(LLM_KV_LEADING_DENSE_BLOCK_COUNT, uint32_t(1));
++    if (mtp) {
++        ms.add_kv(LLM_KV_NEXTN_PREDICT_LAYERS, uint32_t(1));
++    }
+ 
+     if (arch == LLM_ARCH_NEMOTRON_H || arch == LLM_ARCH_NEMOTRON_H_MOE) {
+         std::vector<uint32_t> n_ff_per_layer;
+@@ -305,6 +308,99 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
+     return std::make_pair(std::move(model), std::move(lctx));
+ }
+ 
++struct mtp_sync_test_data {
++    llama_context * ctx;
++    int32_t         n_tokens;
++    bool            saw_sync;
++};
++
++static bool mtp_sync_test_abort(void * user_data) {
++    auto * data = (mtp_sync_test_data *) user_data;
++    // synchronize() accounts queued tokens before the next ubatch starts.
++    if (llama_perf_context(data->ctx).n_p_eval >= data->n_tokens) {
++        data->saw_sync = true;
++    }
++    return false;
++}
++
++static bool mtp_sync_test_decode(llama_model * model, uint32_t n_ubatch) {
++    const int32_t n_tokens = 4;
++    const int32_t n_embd   = llama_model_n_embd_out(model);
++
++    llama_context_params ctx_params = llama_context_default_params();
++    ctx_params.n_ctx = 8;
++    ctx_params.n_batch = n_tokens;
++    ctx_params.n_ubatch = n_ubatch;
++    ctx_params.n_threads = 4;
++    ctx_params.n_threads_batch = 4;
++    ctx_params.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
++
++    llama_context_ptr ctx(llama_init_from_model(model, ctx_params));
++    if (!ctx) {
++        throw std::runtime_error("failed to create MTP context");
++    }
++
++    std::vector<llama_token> token(n_tokens);
++    std::vector<float> embd((size_t) n_tokens * n_embd, 1.0e-2f);
++    std::vector<llama_pos> pos(n_tokens);
++    std::vector<int32_t> n_seq_id(n_tokens, 1);
++    std::vector<llama_seq_id> seq_id_data(n_tokens, 0);
++    std::vector<llama_seq_id *> seq_id(n_tokens);
++    std::vector<int8_t> logits(n_tokens, 0);
++
++    for (int32_t i = 0; i < n_tokens; ++i) {
++        token[i] = i;
++        pos[i] = i;
++        seq_id[i] = &seq_id_data[i];
++    }
++    logits.back() = 1;
++
++    llama_batch batch = {
++        /*.n_tokens =*/ n_tokens,
++        /*.token    =*/ token.data(),
++        /*.embd     =*/ embd.data(),
++        /*.pos      =*/ pos.data(),
++        /*.n_seq_id =*/ n_seq_id.data(),
++        /*.seq_id   =*/ seq_id.data(),
++        /*.logits   =*/ logits.data(),
++    };
++
++    mtp_sync_test_data data = { ctx.get(), n_tokens, false };
++    llama_perf_context_reset(ctx.get());
++    llama_set_abort_callback(ctx.get(), mtp_sync_test_abort, &data);
++    const int32_t ret = llama_decode(ctx.get(), batch);
++    llama_set_abort_callback(ctx.get(), nullptr, nullptr);
++    if (ret != 0) {
++        throw std::runtime_error("failed to decode MTP batch");
++    }
++
++    return data.saw_sync;
++}
++
++static int test_mtp_ubatch_sync(const size_t seed) {
++    gguf_context_ptr gguf_ctx = get_gguf_ctx(LLM_ARCH_QWEN35, false, true);
++    llama_model_params model_params = llama_model_default_params();
++    model_params.progress_callback = silent_model_load_progress;
++    model_params.load_mtp = true;
++
++    size_t tmp = seed;
++    llama_model_ptr model(llama_model_init_from_user(gguf_ctx.get(), set_tensor_data, &tmp, model_params));
++    if (!model) {
++        throw std::runtime_error("failed to create MTP model");
++    }
++
++    if (!mtp_sync_test_decode(model.get(), 2)) {
++        fprintf(stderr, "MTP ubatches were not synchronized\n");
++        return 1;
++    }
++    if (mtp_sync_test_decode(model.get(), 4)) {
++        fprintf(stderr, "single MTP ubatch was synchronized\n");
++        return 1;
++    }
++
++    return 0;
++}
++
+ static std::vector<float> get_logits(
+         llama_model * model, llama_context * lctx, const std::vector<llama_token> & tokens, bool encode = false) {
+     const uint32_t n_vocab  = llama_vocab_n_tokens(llama_model_get_vocab(model));
+@@ -686,6 +782,7 @@ int main(int argc, char ** argv) {
+     size_t seed = rd();
+     ggml_log_level log_level = GGML_LOG_LEVEL_ERROR;
+     std::string out;
++    bool test_mtp_sync = false;
+ 
+     for (int i = 1; i < argc; i++) {
+         if (strcmp(argv[i], "-a") == 0 || strcmp(argv[i], "--arch") == 0) {
+@@ -721,6 +818,9 @@ int main(int argc, char ** argv) {
+                 return 1;
+             }
+         }
++        if (strcmp(argv[i], "--test-mtp-ubatch-sync") == 0) {
++            test_mtp_sync = true;
++        }
+     }
+     printf("%s: using seed %zu\n", __func__, seed);
+ 
+@@ -728,6 +828,9 @@ int main(int argc, char ** argv) {
+         if (!out.empty()) {
+             return save_models(arch, seed, log_level, out);
+         }
++        if (test_mtp_sync) {
++            return test_mtp_ubatch_sync(seed);
++        }
+         return test_backends(arch, seed, log_level);
+     } catch (const std::exception & err) {
+         fprintf(stderr, "encountered runtime error: %s\n", err.what());
+diff --git a/tools/server/server-common.h b/tools/server/server-common.h
+index 7082abd..e7dad76 100644
+--- a/tools/server/server-common.h
++++ b/tools/server/server-common.h
+@@ -216,6 +216,11 @@ public:
+ 
+     bool empty() const { return tokens.empty(); }
+ 
++    // Whether this particular token sequence contains an image/audio chunk.
++    // `has_mtmd` only means that the server was started with an mtmd context;
++    // it is also true for ordinary text-only requests when --mmproj is loaded.
++    bool has_media() const { return !map_idx_to_media.empty(); }
++
+     void clear() {
+         map_idx_to_media.clear();
+         tokens.clear();
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index fdc8f2b..ab76ef6 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -20,6 +20,7 @@
+ #include <algorithm>
+ #include <cstddef>
+ #include <cinttypes>
++#include <cstring>
+ #include <exception>
+ #include <memory>
+ #include <filesystem>
+@@ -206,7 +207,8 @@ struct server_slot {
+     mtmd::batch_ptr mbatch = nullptr;
+ 
+     // speculative decoding
+-    common_speculative * spec;
++    common_speculative * spec = nullptr;
++    bool spec_usable = true;
+ 
+     llama_tokens spec_draft;
+     llama_tokens spec_prompt;
+@@ -259,13 +261,17 @@ struct server_slot {
+ 
+         const size_t cur_size_tgt =           llama_state_seq_get_size_ext(ctx_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+         const size_t cur_size_dft = ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
++        std::vector<uint8_t> state_spec;
++        if (spec_usable) {
++            common_speculative_get_state(spec, id, state_spec);
++        }
+ 
+-        const size_t cur_size = cur_size_tgt + cur_size_dft;
++        const size_t cur_size = cur_size_tgt + cur_size_dft + state_spec.size();
+ 
+         SRV_TRC(" - saving prompt with length %d, total state size = %.3f MiB (draft: %.3f MiB)\n",
+                 (int) prompt.tokens.size(), cur_size / (1024.0 * 1024.0), cur_size_dft / (1024.0 * 1024.0));
+ 
+-        auto * cur = prompt_cache.alloc(prompt, cur_size_tgt, cur_size_dft);
++        auto * cur = prompt_cache.alloc(prompt, cur_size_tgt, cur_size_dft, state_spec.size());
+         if (cur == nullptr) {
+             return false;
+         }
+@@ -274,14 +280,31 @@ struct server_slot {
+         if (ctx_dft) {
+             llama_state_seq_get_data_ext(ctx_dft, cur->data.drft.data(), cur_size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+         }
++        if (!state_spec.empty()) {
++            std::memcpy(cur->data.spec.data(), state_spec.data(), state_spec.size());
++        }
+ 
+         return true;
+     }
+ 
+     bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens) {
+-        bool res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, id);
++        std::vector<uint8_t> state_spec;
++        bool state_loaded = false;
++        bool res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, id, &state_spec, &state_loaded);
+         if (!res) {
+             SLT_WRN(*this, "%s", "failed to load prompt from cache\n");
++            spec_usable = false;
++            common_speculative_invalidate(spec, id);
++        } else if (spec && state_loaded) {
++            if (state_spec.empty()) {
++                // Cache entries created without matching host-side speculative
++                // state remain valid for the target, but cannot safely drive MTP.
++                spec_usable = false;
++                common_speculative_invalidate(spec, id);
++            } else {
++                common_speculative_set_state(spec, id, state_spec);
++                spec_usable = true;
++            }
+         }
+ 
+         return res;
+@@ -293,6 +316,8 @@ struct server_slot {
+         mem.seq_rm(id, -1, -1);
+ 
+         prompt.clear();
++        common_speculative_reset(spec, id);
++        spec_usable = true;
+     }
+ 
+     std::vector<common_adapter_lora_info> lora;
+@@ -325,6 +350,8 @@ struct server_slot {
+     void reset() {
+         SLT_DBG(*this, "%s", "\n");
+ 
++        common_speculative_reset(spec, id);
++
+         spec_is_replay = false;
+ 
+         last_nl_pos    = 0;
+@@ -335,7 +362,7 @@ struct server_slot {
+         stopping_word  = "";
+         n_sent_text    = 0;
+ 
+-        if (can_speculate()) {
++        if (spec) {
+             spec_draft.clear();
+             spec_i_batch.clear();
+             spec_ckpt.clear();
+@@ -424,7 +451,9 @@ struct server_slot {
+     }
+ 
+     bool can_speculate() const {
+-        return !!spec;
++        const bool has_media = prompt.tokens.has_media() || (task && task->tokens.has_media());
++        return spec && spec_usable &&
++            (!has_media || common_speculative_supports_media(spec));
+     }
+ 
+     void add_token(const completion_token_output & token) {
+@@ -503,6 +532,11 @@ struct server_slot {
+ 
+             SLT_INF(*this, "stop processing: n_tokens = %d, truncated = %d\n", prompt.n_tokens(), truncated);
+ 
++            if (spec_usable && !common_speculative_finalize(spec, id)) {
++                SLT_ERR(*this, "%s", "failed to finalize deferred speculative state; clearing cached prompt\n");
++                prompt_clear();
++            }
++
+             t_last_used = ggml_time_us();
+ 
+             state = SLOT_STATE_IDLE;
+@@ -686,6 +720,21 @@ struct server_slot {
+         other.stats = stats;
+ 
+         other.prompt = prompt.clone();
++
++        if (spec && spec_usable) {
++            std::vector<uint8_t> state_spec;
++            if (common_speculative_get_state(spec, id, state_spec)) {
++                common_speculative_set_state(other.spec, other.id, state_spec);
++                other.spec_usable = true;
++            } else {
++                common_speculative_invalidate(other.spec, other.id);
++                other.spec_usable = false;
++            }
++        } else {
++            common_speculative_invalidate(other.spec, other.id);
++            other.spec_usable = false;
++        }
++
+         other.init_sampler();
+     }
+ };
+@@ -1752,6 +1801,15 @@ private:
+ 
+         slot.task = std::make_unique<const server_task>(std::move(task));
+ 
++        // Keep unsupported draft implementations fail-closed. Qwen-style MTP
++        // advertises media support only when it can preserve the M-RoPE grid and
++        // supply token embeddings and target hidden rows independently.
++        if (slot.spec && slot.task->tokens.has_media() &&
++                !common_speculative_supports_media(slot.spec)) {
++            slot.spec_usable = false;
++            common_speculative_invalidate(slot.spec, slot.id);
++        }
++
+         slot.state = slot.task->is_child()
+             ? SLOT_STATE_WAIT_OTHER // wait for the parent to process prompt
+             : SLOT_STATE_STARTED;
+@@ -2854,9 +2912,19 @@ private:
+ 
+                 SLT_WRN(slot, "slot context shift, n_keep = %d, n_left = %d, n_discard = %d\n", n_keep, n_left, n_discard);
+ 
++                if (slot.spec_usable && !common_speculative_finalize(spec.get(), slot.id)) {
++                    throw std::runtime_error("failed to finalize deferred speculative state before context shift");
++                }
++
+                 slot.mem.seq_rm (slot.id, n_keep            , n_keep + n_discard);
+                 slot.mem.seq_add(slot.id, n_keep + n_discard, slot.prompt.tokens.pos_next(), -n_discard);
+ 
++                // The retained hidden rows still carry their pre-shift absolute
++                // positions. Until MTP has an explicit position-shift hook, do
++                // not pair them with the shifted draft KV cache.
++                slot.spec_usable = false;
++                common_speculative_invalidate(spec.get(), slot.id);
++
+                 // add generated tokens to cache
+                 // ref: https://github.com/ggml-org/llama.cpp/pull/16818#discussion_r2473269481
+                 {
+@@ -2920,6 +2988,10 @@ private:
+                     } else {
+                         GGML_ASSERT(slot.spec_i_batch.empty());
+ 
++                        if (use_ckpt_dft && !common_speculative_finalize(spec.get(), slot.id)) {
++                            throw std::runtime_error("failed to finalize deferred speculative state before draft checkpoint");
++                        }
++
+                         slot.spec_ckpt.update_pos(
+                                 slot.prompt.n_tokens(),
+                                 llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id),
+@@ -2928,16 +3000,24 @@ private:
+                         if (use_ckpt_dft) {
+                             slot.spec_ckpt.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                         }
++                        slot.spec_ckpt.data_spec.clear();
++                        common_speculative_get_state(spec.get(), slot.id, slot.spec_ckpt.data_spec);
+ 
+                         slot.spec_prompt = slot.prompt.tokens.get_text_tokens();
+ 
+                         common_speculative_get_draft_params(spec.get(), slot.id) = {
+                             /* .drafting = */ true,
+                             /* .n_max    = */ n_draft_max,
+-                            /* .n_past   = */ slot.prompt.n_tokens(),
++                            // n_past is a llama_pos, not a token count.  They are
++                            // identical for text-only prompts, but M-RoPE media
++                            // chunks can consume a different number of positions
++                            // than tokens.  Starting a draft at n_tokens in that
++                            // case overlaps (or leaves a gap in) the draft KV.
++                            /* .n_past   = */ slot.prompt.tokens.pos_next(),
+                             /* .id_last  = */ slot.sampled,
+                             /* .prompt   = */ &slot.spec_prompt,
+                             /* .result   = */ &slot.spec_draft,
++                            /* .sampler  = */ slot.smpl.get(),
+                         };
+ 
+                         drafting.push_back(&slot);
+@@ -3319,6 +3399,18 @@ private:
+ 
+                         slot.prompt.tokens.keep_first(n_past);
+ 
++                        if (slot.spec && n_past == 0) {
++                            const bool media_ok = !slot.task->tokens.has_media() ||
++                                common_speculative_supports_media(slot.spec);
++                            if (media_ok) {
++                                common_speculative_reset(slot.spec, slot.id);
++                                slot.spec_usable = true;
++                            } else {
++                                common_speculative_invalidate(slot.spec, slot.id);
++                                slot.spec_usable = false;
++                            }
++                        }
++
+                         // this is to signal the client that the request has started processing
+                         if (slot.task->params.stream) {
+                             if (slot.task->params.return_progress) {
+@@ -3847,6 +3939,7 @@ private:
+                         if (slot.ctx_dft) {
+                             ckpt.load_dft(slot.ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                         }
++                        common_speculative_set_state(spec.get(), slot.id, ckpt.data_spec);
+ 
+                         slot.mem.seq_rm(slot.id, ckpt.pos_max + 1, -1);
+ 
+diff --git a/tools/server/server-task.cpp b/tools/server/server-task.cpp
+index 64afbc5..d3a7ebb 100644
+--- a/tools/server/server-task.cpp
++++ b/tools/server/server-task.cpp
+@@ -1705,7 +1705,11 @@ size_t server_prompt_cache::n_tokens() const {
+     return res;
+ }
+ 
+-server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & prompt, size_t state_size_tgt, size_t state_size_dft) {
++server_prompt_cache_state * server_prompt_cache::alloc(
++        const server_prompt & prompt,
++        size_t state_size_tgt,
++        size_t state_size_dft,
++        size_t state_size_spec) {
+     // first check if the current state is contained fully in the cache
+     for (auto it = states.begin(); it != states.end(); ++it) {
+         const int cur_lcp_len = it->prompt.tokens.get_common_prefix(prompt.tokens);
+@@ -1722,7 +1726,7 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
+         checkpoints_size += ckpt.size();
+     }
+ 
+-    const size_t state_size_new = state_size_tgt + state_size_dft + checkpoints_size;
++    const size_t state_size_new = state_size_tgt + state_size_dft + state_size_spec + checkpoints_size;
+ 
+     // skip over-limit entries to avoid disturbing the cache
+     if (limit_size > 0 && state_size_new > limit_size) {
+@@ -1756,11 +1760,13 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
+ 
+     std::vector<uint8_t> state_data_tgt;
+     std::vector<uint8_t> state_data_dft;
++    std::vector<uint8_t> state_data_spec;
+ 
+     // check if we can allocate enough memory for the new state
+     try {
+         state_data_tgt.resize(state_size_tgt);
+         state_data_dft.resize(state_size_dft);
++        state_data_spec.resize(state_size_spec);
+     } catch (const std::bad_alloc & e) {
+         SRV_ERR("failed to allocate memory for prompt cache state: %s\n", e.what());
+ 
+@@ -1781,13 +1787,28 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
+         /*.data   =*/ {
+             /*.main =*/ std::move(state_data_tgt),
+             /*.drft =*/ std::move(state_data_dft),
++            /*.spec =*/ std::move(state_data_spec),
+         },
+     });
+ 
+     return &states.back();
+ }
+ 
+-bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
++bool server_prompt_cache::load(
++        server_prompt & prompt,
++        const server_tokens & tokens_new,
++        llama_context * ctx_tgt,
++        llama_context * ctx_dft,
++        int32_t id_slot,
++        std::vector<uint8_t> * data_spec,
++        bool * state_loaded) {
++    if (data_spec) {
++        data_spec->clear();
++    }
++    if (state_loaded) {
++        *state_loaded = false;
++    }
++
+     const int lcp_best = prompt.tokens.get_common_prefix(tokens_new);
+ 
+     float f_keep_best = prompt.tokens.size() > 0 ? float(lcp_best) / prompt.tokens.size() : -1.0f; // empty slot: any cache entry wins
+@@ -1856,6 +1877,13 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
+             }
+         }
+ 
++        if (data_spec) {
++            *data_spec = std::move(it_best->data.spec);
++        }
++        if (state_loaded) {
++            *state_loaded = true;
++        }
++
+         prompt = std::move(it_best->prompt);
+ 
+         states.erase(it_best);
+diff --git a/tools/server/server-task.h b/tools/server/server-task.h
+index b6da4d4..9bc620b 100644
+--- a/tools/server/server-task.h
++++ b/tools/server/server-task.h
+@@ -583,9 +583,10 @@ struct server_prompt {
+ struct server_prompt_data {
+     std::vector<uint8_t> main;
+     std::vector<uint8_t> drft;
++    std::vector<uint8_t> spec;
+ 
+     size_t size() const {
+-        return main.size() + drft.size();
++        return main.size() + drft.size() + spec.size();
+     }
+ };
+ 
+@@ -622,9 +623,20 @@ struct server_prompt_cache {
+ 
+     size_t n_tokens() const;
+ 
+-    server_prompt_cache_state * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft);
+-
+-    bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
++    server_prompt_cache_state * alloc(
++            const server_prompt & prompt,
++            size_t state_size_main,
++            size_t state_size_drft,
++            size_t state_size_spec = 0);
++
++    bool load(
++            server_prompt & prompt,
++            const server_tokens & tokens_new,
++            llama_context * ctx_tgt,
++            llama_context * ctx_dft,
++            int32_t id_slot,
++            std::vector<uint8_t> * data_spec = nullptr,
++            bool * state_loaded = nullptr);
+ 
+     void update();
+ };

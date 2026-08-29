@@ -1,0 +1,132 @@
+{
+  "execute_confirmation": "MAINTENANCE-AB-WZU-V100",
+  "remote_work_root": "/home/wzu/v100-x1/ab-runs",
+  "ssh": {
+    "wzu": "WZU_Server",
+    "tokyo": "Tokyo_Server",
+    "tokyo_proxy_jump": "WZU_Server"
+  },
+  "locks": {
+    "wzu": "/run/lock/qwen38-maintenance-ab.lock",
+    "tokyo": "/run/lock/qwen38-maintenance-ab.lock"
+  },
+  "production": {
+    "container": "qwen38-27b",
+    "base_url": "http://127.0.0.1:8000",
+    "stop_timeout_seconds": 120,
+    "startup_timeout_seconds": 900
+  },
+  "gateway": {
+    "caddyfile": "/etc/caddy/Caddyfile",
+    "environment_file": "/etc/caddy/qwen-api.env",
+    "caddy_binary": "/usr/local/bin/caddy",
+    "begin_marker": "# BEGIN QWEN PUBLIC API",
+    "end_marker": "# END QWEN PUBLIC API",
+    "site_address": "https://api.47.245.37.106.nip.io:8444",
+    "public_health_url": "https://api.47.245.37.106.nip.io/health",
+    "rollback_seconds": 3600
+  },
+  "drain": {
+    "timeout_seconds": 1800,
+    "stable_polls": 3,
+    "poll_interval_seconds": 2
+  },
+  "candidate_runtime": {
+    "image_id": "sha256:07247b31345790c74ee47631ce792dd1183a4e83ec7bccec240c1708e53b3a1f",
+    "host_port": 18081,
+    "container_port": 8000,
+    "startup_timeout_seconds": 900,
+    "request_timeout_seconds": 3600,
+    "gate_timeout_seconds": 7200,
+    "minimum_free_bytes": 107374182400,
+    "chat_max_tokens": 1024,
+    "model_alias": "qwen3.8-27b-uncensored",
+    "model": "/uncensored/Qwen3.8-27B-Uncensored-Q8_0.gguf",
+    "mmproj": "/uncensored/Qwen3.8-27B-Uncensored-vision-f16.gguf",
+    "host_model": "/home/wzu/models/Qwen3.8-27B-Uncensored-GGUF/Qwen3.8-27B-Uncensored-Q8_0.gguf",
+    "host_mmproj": "/home/wzu/models/Qwen3.8-27B-Uncensored-GGUF/Qwen3.8-27B-Uncensored-vision-f16.gguf",
+    "model_mounts": [
+      "/home/wzu/models/Qwen3.8-27B-GGUF:/official:ro",
+      "/home/wzu/models/Qwen3.8-27B-Uncensored-GGUF:/uncensored:ro"
+    ],
+    "env": {
+      "LD_LIBRARY_PATH": "/opt/llama/bin:/usr/local/cuda/lib64",
+      "GGML_CUDA_ALLREDUCE": "hybrid",
+      "GGML_CUDA_ALLREDUCE_HYBRID_MAX_ELEMS": "131072",
+      "GGML_CUDA_AR_KERNEL_BLOCKS": "3",
+      "GGML_CUDA_AR_F16_WIRE": "1",
+      "NCCL_MIN_NCHANNELS": "8",
+      "NCCL_MAX_NCHANNELS": "8",
+      "NCCL_NTHREADS": "512",
+      "LLAMA_MTP_DEFER_VERIFY": "1",
+      "LLAMA_MTP_DEFER_VERIFY_MIN_POS": "32768",
+      "LLAMA_EXPERIMENTAL_TP_BACKEND_SAMPLING": "1",
+      "LLAMA_EXPERIMENTAL_TP_LOCAL_TOPK": "1",
+      "LLAMA_EXPERIMENTAL_TP_LOCAL_TOPK_K": "20",
+      "GGML_META_PARALLEL_LAUNCH": "1"
+    },
+    "server_args": [
+      "-ngl",
+      "all",
+      "--split-mode",
+      "tensor",
+      "--tensor-split",
+      "1,1",
+      "--fit",
+      "off",
+      "-c",
+      "262144",
+      "--parallel",
+      "1",
+      "-b",
+      "4096",
+      "-ub",
+      "2048",
+      "-fa",
+      "on",
+      "-ctk",
+      "f16",
+      "-ctv",
+      "f16",
+      "--jinja",
+      "--reasoning-format",
+      "deepseek",
+      "--mmproj",
+      "/uncensored/Qwen3.8-27B-Uncensored-vision-f16.gguf",
+      "--spec-type",
+      "draft-mtp",
+      "--spec-draft-n-max",
+      "3",
+      "--spec-draft-backend-sampling",
+      "--backend-sampling"
+    ]
+  },
+  "variants": [
+    {
+      "release_bin": "/home/wzu/v100-x1/releases/20260820-fullopt-20deb624/bin",
+      "expected_manifest_sha256": "1193d168e64f83304313bd91858b0fd2b955c38dbd839062b2c5232a10b1c295",
+      "expected_legacy_content_sha256": "37af26bd62ffcb4491bfbaf476e061ac893a7f01e4251fe61a7d51a960852ea2",
+      "name": "A-async-copy-off",
+      "env": {
+        "LLAMA_MTP_CANDIDATE_K": "1",
+        "LLAMA_EXPERIMENTAL_TP_LOCAL_TOPK_K": "1",
+        "LLAMA_MTP_DEFER_VERIFY": "1",
+        "LLAMA_EXPERIMENTAL_MTP_MIRROR_LAYER": "0",
+        "GGML_META_ASYNC_HOST_COPY": "0"
+      }
+    },
+    {
+      "release_bin": "/home/wzu/v100-x1/releases/20260820-fullopt-20deb624/bin",
+      "expected_manifest_sha256": "1193d168e64f83304313bd91858b0fd2b955c38dbd839062b2c5232a10b1c295",
+      "expected_legacy_content_sha256": "37af26bd62ffcb4491bfbaf476e061ac893a7f01e4251fe61a7d51a960852ea2",
+      "name": "B-async-copy-on",
+      "env": {
+        "LLAMA_MTP_CANDIDATE_K": "1",
+        "LLAMA_EXPERIMENTAL_TP_LOCAL_TOPK_K": "1",
+        "LLAMA_MTP_DEFER_VERIFY": "1",
+        "LLAMA_EXPERIMENTAL_MTP_MIRROR_LAYER": "0",
+        "GGML_META_ASYNC_HOST_COPY": "1"
+      }
+    }
+  ]
+}

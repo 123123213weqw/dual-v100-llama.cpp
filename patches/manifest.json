@@ -57,6 +57,21 @@
         "sm70-fattn-gqa-head-grouping",
         "sm70-gdn-launch-tuning"
       ]
+    },
+    "production-current-2026-08-29": {
+      "file": "production-current-2026-08-29.patch",
+      "sha256": "b0a18fc0d16f8283665c57cc3136b461142f308ed71e5451fc1f3f704cc513ab",
+      "components": [
+        "meta-tensor-parallel",
+        "async-host-copy",
+        "parallel-meta-launch",
+        "tensor-parallel-backend-sampling",
+        "tensor-parallel-local-topk",
+        "mtp-deferred-verification",
+        "mtp-target-sampler-alignment",
+        "v100-sm70-kernel-tuning",
+        "server-slot-and-cache-integration"
+      ]
     }
   }
 }

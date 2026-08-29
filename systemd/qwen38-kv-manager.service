@@ -1,0 +1,27 @@
+[Unit]
+Description=Qwen3.8 llama.cpp cold KV checkpoint manager
+After=docker.service network-online.target
+Requires=docker.service
+
+[Service]
+Type=simple
+User=wzu
+Group=wzu
+UMask=0077
+Environment=LLAMA_URL=http://127.0.0.1:8000
+Environment=KV_CACHE_DIR=/data/wzu/llama-kv
+Environment=KV_QUIET_SECONDS=30
+Environment=KV_POLL_SECONDS=1
+Environment=KV_MIN_SAVE_INTERVAL=300
+Environment=KV_MIN_TOKEN_DELTA=8192
+ExecStart=/usr/bin/python3 /home/wzu/v100-x1/production/kv-cache-manager.py
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/data/wzu/llama-kv
+
+[Install]
+WantedBy=multi-user.target

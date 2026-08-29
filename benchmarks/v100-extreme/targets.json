@@ -1,0 +1,32 @@
+{
+  "name": "V100-X1",
+  "hardware": "2x Tesla V100 PCIe 32GB",
+  "model": "Qwen3.8-27B Q8",
+  "runs": {
+    "warmup": 2,
+    "measured": 7,
+    "pass_statistics": ["median", "p10"]
+  },
+  "fixed": {
+    "context_tokens": 262144,
+    "kv_type": "f16",
+    "parallel": 1,
+    "flash_attention": true,
+    "mtp_n_max": 3,
+    "tensor_split": [1, 1]
+  },
+  "targets": {
+    "prefill_71351_tps": 1000.0,
+    "decode_short_tps": 85.0,
+    "decode_71351_tps": 85.0,
+    "decode_158000_tps": 65.0,
+    "decode_256000_tps": 50.0,
+    "cached_prefix_ttft_71351_ms": 250.0,
+    "v100_x_score": 145.0
+  },
+  "quality": {
+    "max_relative_regression_percent": 0.5,
+    "full_context_required": true,
+    "operator_tests_required": true
+  }
+}

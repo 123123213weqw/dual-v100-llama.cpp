@@ -1,0 +1,298 @@
+{
+  "date": "2026-10-01",
+  "change_type": "runtime",
+  "variant": "matched-communication",
+  "production_status": "deployed-and-audited",
+  "source_head": "5a393c902ce5b0c08fb994a4feec8aec632d6019",
+  "candidate_source_head": "5a393c902ce5b0c08fb994a4feec8aec632d6019",
+  "binary_changed": false,
+  "server_sha256": "e5b1b5782cd5b4acec5316ac5bd40123e0b0c9826643ae4148b0ec6e359f5fa2",
+  "cuda_library_sha256": "205500226631ba3a45f3fbcb512b1e8d0957bbbfeeebe7ad74c0c6c3969f9d5d",
+  "hardware": {
+    "gpus": "2x Tesla V100-PCIE-32GB",
+    "sm": 70,
+    "interconnect": "NODE; no NVLink",
+    "driver": "580.178.04",
+    "cuda_container": "12.8.1",
+    "nccl": "2.25.1",
+    "power_limit_w": 250,
+    "gpu_settings_changed": false,
+    "round7_gpu_memory_and_clock_timeseries_recorded": false,
+    "post_rollout_point_sample": {
+      "memory_used_mib": [
+        27073,
+        25905
+      ],
+      "sm_clock_mhz": [
+        1230,
+        1230
+      ],
+      "memory_clock_mhz": [
+        877,
+        877
+      ],
+      "power_limit_w": [
+        250,
+        250
+      ],
+      "scope": "single read-only post-rollout sample, not Round7 benchmark peak or a before/after memory claim"
+    }
+  },
+  "invariants": {
+    "weights": "Q8_0",
+    "kv_key": "f16",
+    "kv_value": "f16",
+    "context": 262144,
+    "multimodal": true,
+    "batch": 4096,
+    "ubatch": 2048,
+    "parallel": 1,
+    "mtp_draft_n_max": 3,
+    "sampler_changed": false,
+    "cpu_pinning_changed": false
+  },
+  "communication": {
+    "GGML_CUDA_ALLREDUCE": "hybrid",
+    "GGML_CUDA_ALLREDUCE_HYBRID_MAX_ELEMS": "32767",
+    "GGML_CUDA_AR_BF16_THRESHOLD": "0",
+    "GGML_CUDA_AR_F16_WIRE": "0",
+    "GGML_CUDA_AR_KERNEL_BLOCKS": "8"
+  },
+  "server_command": [
+    "/opt/llama/bin/llama-server",
+    "-m",
+    "/uncensored/Qwen3.8-27B-Uncensored-Q8_0.gguf",
+    "--alias",
+    "qwen3.8-27b-uncensored",
+    "--host",
+    "0.0.0.0",
+    "--port",
+    "8000",
+    "--metrics",
+    "-ngl",
+    "all",
+    "--split-mode",
+    "tensor",
+    "--tensor-split",
+    "1,1",
+    "--fit",
+    "off",
+    "-c",
+    "262144",
+    "--parallel",
+    "1",
+    "-b",
+    "4096",
+    "-ub",
+    "2048",
+    "-fa",
+    "on",
+    "-ctk",
+    "f16",
+    "-ctv",
+    "f16",
+    "--jinja",
+    "--reasoning-format",
+    "deepseek",
+    "--mmproj",
+    "/uncensored/Qwen3.8-27B-Uncensored-vision-f16.gguf",
+    "--spec-type",
+    "draft-mtp",
+    "--spec-draft-n-max",
+    "3",
+    "--spec-draft-backend-sampling",
+    "--backend-sampling",
+    "--cache-prompt",
+    "--cache-idle-slots",
+    "-cram",
+    "131072",
+    "--slot-save-path",
+    "/kv-cache"
+  ],
+  "runtime_env": {
+    "LLAMA_EXPERIMENTAL_TP_LOCAL_TOPK_K": "10",
+    "LLAMA_EXPERIMENTAL_MTP_MIRROR_LAYER": "0",
+    "LLAMA_MTP_DEFER_VERIFY_MIN_POS": "32768",
+    "LLAMA_MTP_CANDIDATE_K": "10",
+    "LLAMA_MTP_ALIGN_TARGET_SAMPLER": "1",
+    "GGML_META_ASYNC_HOST_COPY": "1",
+    "LLAMA_MTP_DEFER_VERIFY": "1",
+    "GGML_META_PARALLEL_LAUNCH": "1",
+    "OMP_NUM_THREADS": "16",
+    "LLAMA_EXPERIMENTAL_TP_BACKEND_SAMPLING": "1",
+    "LLAMA_EXPERIMENTAL_TP_LOCAL_TOPK": "1"
+  },
+  "method": {
+    "ordering": "baseline-a / candidate / baseline-b",
+    "seeds": [
+      1234,
+      1235,
+      1236
+    ],
+    "fresh_server_per_warm_sample": true,
+    "warm_cache_tokens": "prompt length minus one",
+    "warm_prompt_n": 1,
+    "warm_predicted_n": 1024,
+    "warmups": "restore common full chat checkpoint before each measured request; no separate repeated warmup loop",
+    "paired_baseline": "geometric mean of adjacent A and B",
+    "interval": "approximate paired log-ratio 95% interval with n=3, not multiple-comparison adjusted",
+    "ttft": "not streaming measured; cold first-token HTTP wall time proxy only"
+  },
+  "decode": [
+    {
+      "context": 0,
+      "prompt_tokens": 99,
+      "baseline_tps_mean": 54.6835429479191,
+      "candidate_tps_mean": 55.92239979512075,
+      "gain_pct": 2.1092814541565654,
+      "approx_ci95_pct": [
+        -8.58499152461783,
+        14.054634276951795
+      ],
+      "paired_runs": 3,
+      "reliable_positive_in_this_test": false,
+      "max_baseline_drift_pct": 9.233244648882799
+    },
+    {
+      "context": 32768,
+      "prompt_tokens": 32768,
+      "baseline_tps_mean": 50.04629961709169,
+      "candidate_tps_mean": 52.05102748377902,
+      "gain_pct": 4.012849835613076,
+      "approx_ci95_pct": [
+        3.096530418872296,
+        4.93731347670442
+      ],
+      "paired_runs": 3,
+      "reliable_positive_in_this_test": true,
+      "max_baseline_drift_pct": 0.7699202977543784
+    },
+    {
+      "context": 131072,
+      "prompt_tokens": 131072,
+      "baseline_tps_mean": 40.48996535747415,
+      "candidate_tps_mean": 41.71569873042268,
+      "gain_pct": 3.0420654244717196,
+      "approx_ci95_pct": [
+        0.7418072824824387,
+        5.394845827700085
+      ],
+      "paired_runs": 3,
+      "reliable_positive_in_this_test": true,
+      "max_baseline_drift_pct": 1.1776727314622537
+    },
+    {
+      "context": 255000,
+      "prompt_tokens": 255000,
+      "baseline_tps_mean": 37.31841664463594,
+      "candidate_tps_mean": 38.77136090629547,
+      "gain_pct": 3.8823415628300038,
+      "approx_ci95_pct": [
+        2.9103698123307082,
+        4.8634934288559615
+      ],
+      "paired_runs": 3,
+      "reliable_positive_in_this_test": true,
+      "max_baseline_drift_pct": 0.9761776214712192
+    }
+  ],
+  "cold_prefill": [
+    {
+      "context": 0,
+      "baseline_a_prompt_tps": 65.11701461079626,
+      "candidate_prompt_tps": 53.07953372337763,
+      "baseline_b_prompt_tps": 65.47007850396862,
+      "baseline_a_first_token_http_wall_s": 1.5083710130129475,
+      "candidate_first_token_http_wall_s": 1.849595777981449,
+      "baseline_b_first_token_http_wall_s": 1.4999025269935373,
+      "one_set_only": true
+    },
+    {
+      "context": 32768,
+      "baseline_a_prompt_tps": 1077.8471635287597,
+      "candidate_prompt_tps": 1083.5193098702537,
+      "baseline_b_prompt_tps": 1091.6734504097333,
+      "baseline_a_first_token_http_wall_s": 30.448714504018426,
+      "candidate_first_token_http_wall_s": 30.273414105002303,
+      "baseline_b_first_token_http_wall_s": 30.052019604016095,
+      "one_set_only": true
+    },
+    {
+      "context": 131072,
+      "baseline_a_prompt_tps": 819.4309394068547,
+      "candidate_prompt_tps": 819.4238288469434,
+      "baseline_b_prompt_tps": 816.999503795176,
+      "baseline_a_first_token_http_wall_s": 160.09910630100057,
+      "candidate_first_token_http_wall_s": 160.11318607599242,
+      "baseline_b_first_token_http_wall_s": 160.57018156000413,
+      "one_set_only": true
+    },
+    {
+      "context": 255000,
+      "baseline_a_prompt_tps": 607.912058438782,
+      "candidate_prompt_tps": 600.7451280716009,
+      "baseline_b_prompt_tps": 609.7624182937573,
+      "baseline_a_first_token_http_wall_s": 419.6599535259884,
+      "candidate_first_token_http_wall_s": 424.65557502402226,
+      "baseline_b_first_token_http_wall_s": 418.4531858219998,
+      "one_set_only": true
+    }
+  ],
+  "acceptance": {
+    "round7_measurements": 48,
+    "warm_samples": 36,
+    "cold_samples": 12,
+    "deterministic_outputs_identical": true,
+    "mtp_draft_counts_identical": true,
+    "natural_text_contexts": [
+      0,
+      32768,
+      131072,
+      253000
+    ],
+    "natural_text_responses": 12,
+    "vision_fixtures": 3,
+    "vision_responses": 9,
+    "full_messages_including_reasoning_identical": true,
+    "natural_eos": true,
+    "max_tokens": 8192,
+    "independent_prefill": true,
+    "semantic_checks": true,
+    "scope": "synthetic text and image fixtures; not a universal quality guarantee"
+  },
+  "not_promoted": {
+    "q8_packed_numa": "Round12 stopped on user request; confirmation incomplete",
+    "flash_attention_geometry": "screening did not show acceptable net gain",
+    "larger_hybrid_threshold": "changed cold-prefill text; rejected"
+  },
+  "evidence_sha256": {
+    "round7-chat-matched/measurements.jsonl": "391df7d1ea1edfa2baa5d9a286ec72db9ebde403b28ff4e8d0c0ba4e5876dfc8",
+    "round7-chat-matched/final-analysis.json": "7147a03ac79f9dabae7fd3ffdb8c03767aceb0eeeb9aef39d65ab5fd83a94302",
+    "round8-natural-quality/tested-environments.json": "bbce767cb37e73183f04d6f70a1c3e955ae02a759a1b5025396f3bc21a001037",
+    "round6-matched-vision/tested-environments.json": "bbce767cb37e73183f04d6f70a1c3e955ae02a759a1b5025396f3bc21a001037",
+    "accepted-communication-composite": "d530aa2a0b2f7d4a7f9e559b5159a5e535fa0038f029a34e5dc9ac2a53dd8c23",
+    "switch-controller-v3": "5f5dbf89159bcccee217cee2169b8d2fcb8347a1f3dbdee7c6a6c434dd86e944",
+    "current-best-wrapper-v3": "219df7995496cd181dd4ec81d6e8f6b8a0adb651b91b99fc7b61bf500f23cd6e"
+  },
+  "production_acceptance": {
+    "committed_at_cst": "2026-10-01 17:10:20",
+    "variant": "matched",
+    "rollout_unit_terminal_success": true,
+    "docker_restart_policy": "unless-stopped",
+    "both_health_ports_ok": true,
+    "docker_health": "healthy",
+    "actual_production_vision_identical": true,
+    "user_cache_byte_roundtrip": true,
+    "wash_progress_hashes_unchanged": true,
+    "gateway_process_retained": true,
+    "original_container_retained_stopped": true,
+    "original_image_cmd_entrypoint_preserved": true,
+    "original_complete_release_hashes_preserved": true,
+    "cpu_pinning_unchanged": true,
+    "manual_rollback_runtime_tested": false,
+    "controller_mock_rollback_and_cache_tests_passed": true,
+    "engine_compatibility": "HostConfig.OomKillDisable null/false canonicalized only for clone comparison; true and all other fields remain significant",
+    "prior_failed_attempts_preserved": 2,
+    "scope": "No new TPS benchmark was run on live production; throughput values are completed controlled A/C/B experiments"
+  }
+}

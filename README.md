@@ -14,11 +14,11 @@ reviewable patch variants, and makes every performance claim reproducible.
 
 [单张 V100 SM70 内核调优报告](docs/benchmark-sm70-tuning-2026-08-18.zh-CN.md)
 
-[双 V100 当前生产配置与 MTP/DFlash2 A/B（2026-08-29）](docs/production-2026-08-29.zh-CN.md)
+[双 V100 生产基线与 MTP/DFlash2 A/B（2026-08-29）](docs/production-2026-08-29.zh-CN.md)
 
 ### Production snapshot: 2026-08-29
 
-The current two-V100 production profile uses Qwen3.8-27B-Uncensored Q8_0,
+The 2026-08-29 two-V100 production baseline uses Qwen3.8-27B-Uncensored Q8_0,
 tensor split `1,1`, a 262,144-token context, F16 KV, and the built-in MTP head
 with draft length 3. On the deterministic 116,934-token security-audit fixture
 it measured **833.37 prompt tok/s** and **43.34 decode tok/s**. The matching
@@ -26,7 +26,18 @@ DFlash2 Q8 candidate measured 607.82 prompt tok/s and 33.00 decode tok/s, so MTP
 remains the production default. Deployment, rollback, cold-KV persistence, the
 current patch, and machine-readable A/B results are now tracked in this repo.
 
-## Current result
+## 2026-10-01 dual-V100 communication result
+
+The matched-precision communication overlay preserves Q8_0 weights, F16 KV,
+262144 context and multimodal support. Paired warm-decode tests measured
++4.01% at 32K, +3.04% at 128K and +3.88% at 255K; short-context gain is not
+statistically reliable, and cold short-prefill can be slower. No kernel binary
+replacement or unconfirmed Q8/NUMA promotion is included.
+See [the dated report](docs/benchmark-dual-v100-2026-10-01.zh-CN.md),
+[overlay](config/sm70-matched-allreduce.sh) and
+[prompt-free results](results/sm70-matched-allreduce-2026-10-01.json).
+
+## 2026-08-16 result
 
 Validated on 2x V100 with tensor split `1,1`, context `262144`, parallel `1`,
 batch `2048`, ubatch `512`, Flash Attention enabled, F16 KV cache, and MTP draft
